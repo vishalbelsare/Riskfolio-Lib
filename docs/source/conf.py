@@ -14,23 +14,22 @@ import os
 import sys
 import sphinx_rtd_theme
 
+import riskfolio as rp
+
 sys.path.insert(0, os.path.abspath('../..'))
 sys.path.insert(1, os.path.abspath('../../riskfolio'))
 sys.path.insert(2, os.path.abspath('../../riskfolio/src'))
 sys.path.insert(3, os.path.abspath('../../riskfolio/external'))
 
-
 # -- Project information -----------------------------------------------------
 
 project = 'Riskfolio-Lib'
-copyright = '2020-2022, Dany Cajas'
+copyright = '2020-2026, Dany Cajas'
 author = 'Dany Cajas'
 
-# The short X.Y version
-version = 'latest'
-# The full version, including alpha/beta/rc tags
-release = '4.0.3'
 
+# The short X.Y version
+release = '.'.join(rp.__version__.split('.')[:2])
 
 # -- General configuration ---------------------------------------------------
 
@@ -38,22 +37,24 @@ release = '4.0.3'
 # extensions coming with Sphinx (named 'sphinx.ext.*') or your custom
 # ones.
 extensions = [
-# #    'numpydoc',
+#     'numpydoc',
 #     'sphinx_rtd_theme',
-     'sphinx.ext.autodoc',
-#     'sphinx.ext.doctest',
-     'sphinx.ext.autosummary',
-#     'sphinx_autopackagesummary',
-     'sphinx.ext.intersphinx',
-     'sphinx.ext.todo',
-#     'sphinx.ext.coverage',
-     'sphinx.ext.mathjax',
-#     'sphinx.ext.ifconfig',
-     'sphinx.ext.viewcode',
-# #    'sphinx.ext.githubpages',
-     'sphinx.ext.napoleon',
-     'sphinxcontrib.bibtex',
-     'sphinxemoji.sphinxemoji',
+    'sphinx.ext.autodoc',
+#    'sphinx.ext.doctest',
+    'sphinx.ext.autosummary',
+#    'sphinx_autopackagesummary',
+    'sphinx.ext.intersphinx',
+    'sphinx.ext.todo',
+#    'sphinx.ext.coverage',
+    'sphinx.ext.mathjax',
+#    'sphinx.ext.ifconfig',
+    'sphinx.ext.viewcode',
+#     Generates .nojekyll so GitHub Pages serves _static assets (e.g. MathJax).
+    'sphinx.ext.githubpages',
+    'sphinx.ext.napoleon',
+    'sphinxcontrib.bibtex',
+    'sphinxemoji.sphinxemoji',
+    'sphinx_immaterial',
 ]
 
 autodoc_mock_imports = ["riskfolio.external.functions"]
@@ -69,7 +70,7 @@ templates_path = ['_templates']
 #
 #source_suffix = ['.rst', '.bib']
 source_suffix = '.rst'
-bibtex_bibfiles = ['biblio.bib']
+bibtex_bibfiles = ['riskfoliolib/biblio.bib']
 
 
 # List of patterns, relative to source directory, that match files and
@@ -83,7 +84,33 @@ exclude_patterns = []
 # The theme to use for HTML and HTML Help pages.  See the documentation for
 # a list of builtin themes.
 #
-html_theme = 'sphinx_rtd_theme'
+html_title = f"{project} {release} | Portfolio Optimization in Python"
+html_theme = 'sphinx_immaterial'
+
+# Select docs base URL depending on CI host.
+is_rtd = os.environ.get("READTHEDOCS") == "True"
+is_github_pages = (
+    os.environ.get("GITHUB_ACTIONS", "").lower() == "true"
+    or os.environ.get("GITHUB_PAGES", "").lower() == "true"
+)
+
+docs_baseurl_override = os.environ.get("DOCS_BASEURL", "").strip()
+if docs_baseurl_override:
+    docs_baseurl = docs_baseurl_override
+elif is_github_pages and not is_rtd:
+    docs_baseurl = "https://dcajasn.github.io/Riskfolio-Lib/"
+else:
+    docs_baseurl = "https://riskfolio-lib.readthedocs.io/en/latest/"
+
+if not docs_baseurl.endswith("/"):
+    docs_baseurl = f"{docs_baseurl}/"
+
+html_baseurl = docs_baseurl
+google_site_verification = os.environ.get("GOOGLE_SITE_VERIFICATION", "").strip()
+html_context = {
+    "docs_baseurl": docs_baseurl,
+    "google_site_verification": google_site_verification,
+}
 
 # Add any paths that contain custom static files (such as style sheets) here,
 # relative to this directory. They are copied after the builtin static files,
@@ -91,6 +118,63 @@ html_theme = 'sphinx_rtd_theme'
 html_static_path = ['_static']
 
 html_search_language = 'en'
+html_theme_options = {
+    "palette": {"accent": "green"},
+    "icon": {"repo": "fontawesome/brands/github"},
+    "site_url": docs_baseurl,
+    "repo_url": "https://github.com/dcajasn/Riskfolio-Lib",
+    "repo_name": "Riskfolio-Lib",
+    "globaltoc_collapse": True,
+    "toc_title": "Contents",
+    "toc_title_is_page_title": True,
+    "features": [
+        # "header.autohide",
+        # "toc.integrate",  # enable/disable right sidebar
+        "toc.follow",
+        # "toc.sticky",
+        "navigation.path",  # breadcrumbs, not yet available.
+        # "navigation.sections",  # top-level sections are rendered as groups in the sidebar for viewports above 1220px; not compatible with tabs below.
+        # Disable SPA-style navigation to guarantee MathJax re-renders on each page load.
+        # This avoids intermittent equation rendering issues on static hosts.
+        # "navigation.instant",
+        # clicks on all internal links will be intercepted and dispatched via XHR without fully reloading the page
+        "navigation.top",
+        # back-to-top button can be shown when the user, after scrolling down, starts to scroll up again. It's rendered centered and just below the header; not yet available.
+        "navigation.tabs",
+        # top-level sections are rendered in a menu layer below the header for viewports above 1220px, but remain as-is on mobile
+        "navigation.tabs.sticky",
+        # navigation tabs will lock below the header and always remain visible when scrolling down
+        "navigation.tracking",  # the URL in the address bar is automatically updated with the active anchor
+        "navigation.expand",
+        # the left sidebar will expand all collapsible subsections by default, so the user doesn't have to open subsections manually
+        "search.highlight",
+        # a user clicks on a search result, Material for MkDocs will highlight all occurrences after following the link
+        "search.share",
+        # a  share button is rendered next to the reset button, which allows to deep link to the current search query and result
+        "content.tabs.link",
+        "content.code.copy",
+    ],
+    "social": [
+        {
+            "icon": "fontawesome/brands/github",
+            "link": "https://github.com/dcajasn/Riskfolio-Lib",
+            "name": "Source on github.com",
+        },
+        {
+            "icon": "fontawesome/brands/python",
+            "link": "https://pypi.org/project/Riskfolio-Lib/",
+        },
+        {
+            "icon": "fontawesome/brands/square-x-twitter",
+            "link": "https://x.com/RiskfolioLib",
+        },
+    ],
+}
+html_static_path = ["_static"]
+html_css_files = ["custom.css"]
+html_favicon = "_static/Riskfolio.ico"
+html_logo = "_static/Riskfolio.png"
+
 
 # -- Extension configuration -------------------------------------------------
 
@@ -102,11 +186,15 @@ python_version = '.'.join(map(str, sys.version_info[0:2]))
 intersphinx_mapping = {
     'sphinx': ('https://www.sphinx-doc.org/en/master/', None),
     'python': ('https://docs.python.org/' + python_version, None),
-    'matplotlib': ('https://matplotlib.org', None),
     'numpy': ('https://numpy.org/doc/stable/', None),
-    'sklearn': ('https://scikit-learn.org/stable/', None),
-    'pandas': ('https://pandas.pydata.org/docs/', None),
     'scipy': ('https://docs.scipy.org/doc/scipy/reference/', None),
+    'pandas': ('https://pandas.pydata.org/docs/', None),
+    'matplotlib': ('https://matplotlib.org', None),
+    'clarabel': ('https://oxfordcontrol.github.io/ClarabelDocs/stable/', None),
+    'scs': ('https://www.cvxgrp.org/scs/', None),
+    'cvxpy': ('https://www.cvxpy.org/', None),
+    'sklearn': ('https://scikit-learn.org/stable/', None),
+    'statsmodels': ('https://www.statsmodels.org/stable/', None),
     'arch': ('https://bashtage.github.io/arch/', None),
     'xlsxwriter': ('https://xlsxwriter.readthedocs.io', None),
     'networkx': ('https://networkx.org/documentation/stable/', None),
@@ -118,3 +206,18 @@ intersphinx_mapping = {
 
 # If true, `todo` and `todoList` produce output, else they produce nothing.
 todo_include_todos = True
+
+
+def _write_robots_txt(app, exception):
+    if exception is None:
+        robots_path = os.path.join(app.outdir, 'robots.txt')
+        with open(robots_path, 'w', encoding='utf-8') as robots_file:
+            robots_file.write(
+                'User-agent: *\n'
+                'Disallow: /cgi-bin\n'
+                f'Sitemap: {docs_baseurl}sitemap.xml\n'
+            )
+
+
+def setup(app):
+    app.connect('build-finished', _write_robots_txt)

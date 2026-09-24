@@ -1,6 +1,7 @@
 """"""  #
+
 """
-Copyright (c) 2020-2022, Dany Cajas
+Copyright (c) 2020-2025, Dany Cajas
 All rights reserved.
 This work is licensed under BSD 3-Clause "New" or "Revised" License.
 License available at https://github.com/dcajasn/Riskfolio-Lib/blob/master/LICENSE.txt
@@ -10,16 +11,45 @@ import numpy as np
 import pandas as pd
 import cvxpy as cp
 import scipy.stats as st
-from scipy.linalg import sqrtm
+from numpy.linalg import pinv
+from scipy.linalg import sqrtm, norm, null_space
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
 import riskfolio.src.RiskFunctions as rk
 import riskfolio.src.ParamsEstimation as pe
 import riskfolio.src.AuxFunctions as af
 import riskfolio.src.OwaWeights as owa
 import riskfolio.external.cppfunctions as cf
 
-
 __all__ = [
     "Portfolio",
+]
+
+rmeasures = [
+    "MV",
+    "KT",
+    "MAD",
+    "GMD",
+    "MSV",
+    "SKT",
+    "FLPM",
+    "SLPM",
+    "CVaR",
+    "TG",
+    "EVaR",
+    "RLVaR",
+    "WR",
+    "CVRG",
+    "TGRG",
+    "EVRG",
+    "RVRG",
+    "RG",
+    "MDD",
+    "ADD",
+    "CDaR",
+    "EDaR",
+    "RLDaR",
+    "UCI",
 ]
 
 
@@ -30,23 +60,25 @@ class Portfolio(object):
 
     Parameters
     ----------
-    returns : DataFrame, optional
-        A dataframe that containts the returns of the assets.
+    returns : DataFrame of shape (n_samples, n_assets), optional
+        Assets returns DataFrame, where n_samples is the number of
+        observations and n_assets is the number of assets.
         The default is None.
     sht : bool, optional
         Indicate if the portfolio consider short positions (negative weights).
         The default is False.
     uppersht : float, optional
-        Indicate the maximum value of the sum of absolute values of short
+        Indicate the maximum absolute value of short
         positions (negative weights). The default is 0.2.
     upperlng : float, optional
-        Indicate the maximum value of the sum of long positions (positive
-        weights). When sht=True, the difference between upperlng and uppersht
-        must be equal to the budget (upperlng - uppersht = budget)
+        Indicate the maximum value of long positions (positive weights).
         The default is 1.
     budget : float, optional
         Indicate the maximum value of the sum of long positions (positive
         weights) and short positions (negative weights). The default is 1.
+    budgetsht : float, optional
+        Indicate the maximum value of the sum of absolute value of short
+        positions (negative weights). The default is 0.2.
     nea : int, optional
         Indicate the minimum number of effective assets (NEA) used in
         portfolio. This value is the inverse of Herfindahl-Hirschman index of
@@ -58,9 +90,9 @@ class Portfolio(object):
     factors : DataFrame, optional
         A dataframe that containts the returns of the factors.
         The default is None.
-    B : DataFrame, optional
-        A dataframe that containts the loadings matrix.
-        The default is None.
+    B : DataFrame of shape (n_assets, n_factors), optional
+        Loadings matrix, where n_assets is the number assets and n_factors is
+        the number of risk factors. The default is None.
     alpha : float, optional
         Significance level of CVaR, EVaR, CDaR, EDaR and Tail Gini of losses. The default is 0.05.
     a_sim : float, optional
@@ -71,6 +103,10 @@ class Portfolio(object):
     b_sim : float, optional
         Number of CVaRs used to approximate Tail Gini of gains. If None it duplicates a_sim value.
         The default is None.
+    kappa : float, optional
+        Deformation parameter of RLVaR and RLDaR, must be between 0 and 1. The default is 0.30.
+    kappa_g : float, optional
+        Deformation parameter of RLVaR of gains used in RLVaR Range, must be between 0 and 1. The default is None.
     n_max_kurt : int, optional
         Maximum number of assets to use Kurtosis model based on semidefinte formulation. If number of
         assets is higher than n_max_kurt, it uses relaxed kurtosis model based on second order cone.
@@ -94,15 +130,85 @@ class Portfolio(object):
         A dataframe that containts the weights of an index. The default is the
         equally weighted portfolio 1/N.
     ainequality : nd-array, optional
-        The matrix :math:`A` of the linear constraint :math:`A \geq B`.
+        The matrix :math:`A` of the linear constraint :math:`A \leq b`.
         The default is None.
     binequality : 1d-array, optional
-        The matrix :math:`B` of the linear constraint :math:`A \geq B`.
+        The matrix :math:`b` of the linear constraint :math:`A \leq b`.
+        The default is None.
+    arcinequality : nd-array, optional
+        The matrix :math:`A_{rc}` of the linear constraint :math:`A_{rc} \text{diag}(\text{Tr}(\Sigma X)) \leq b_{rc} \text{Tr}(\Sigma X)`.
+        The default is None.
+    brcinequality : 1d-array, optional
+        The matrix :math:`B_{rc}` of the linear constraint :math:`A_{rc} \text{diag}(\text{Tr}(\Sigma X)) \leq b_{rc} \text{Tr}(\Sigma X)`.
+        The default is None.
+    afrcinequality : nd-array, optional
+        The matrix :math:`A_{frc}` of the linear constraint :math:`A_{frc} \text{diag}\left ( \bar{\Sigma} W_{\text{f}} \right) \leq b_{frc} \, \text{Tr} \left ( \bar{\Sigma} W_{\text{f}} \right )`.
+        The default is None.
+    bfrcinequality : 1d-array, optional
+        The matrix :math:`b_{frc}` of the linear constraint :math:`A_{frc} \text{diag}\left ( \bar{\Sigma} W_{\text{f}} \right) \leq b_{frc} \, \text{Tr} \left ( \bar{\Sigma} W_{\text{f}} \right )`.
+        The default is None.
+    aintinequality : nd-array, optional
+        The matrix :math:`A_{int}` of the linear integer constraint :math:`A_{int}k \leq B_{int}`.
+        The default is None.
+    bintinequality : 1d-array, optional
+        The matrix :math:`B_{int}` of the linear integer constraint :math:`A_{int}k \leq B_{int}`.
+        The default is None.
+    cintinequality : nd-array, optional
+        The matrix :math:`C_{int}` of the linear integer constraint :math:`C_{int}k \leq D_{int} \odot k_{s}`.
+        The default is None.
+    dintinequality : 1d-array, optional
+        The matrix :math:`D_{int}` of the linear integer constraint :math:`C_{int}k \leq D_{int} \odot k_{s}`.
+        The default is None.
+    eintinequality : nd-array, optional
+        The matrix :math:`E_{int}` of the linear integer constraint :math:`E_{int} k_{s}\leq F_{int}`.
+        The default is None.
+    fintinequality : 1d-array, optional
+        The matrix :math:`F_{int}` of the linear integer constraint :math:`E_{int} k_{s}\leq F_{int}`.
+        The default is None.
+    b : 1d-array, optional
+        The risk budgeting constraint vector. The default is None.
+    network_sdp : nd-array, optional
+        Connection matrix for semidefinite programming (SDP) network constraint.
+        Users cannot use network_sdp and network_ip at the same time, when a value
+        is assigned to network_sdp automatically network_ip becomes None.
+        This constraint is based on :cite:`a-Cajas10` and :cite:`a-Cajas11`.
+        The default is None.
+    cluster_sdp : nd-array, optional
+        Adjacency label matrix for semidefinite programming (SDP) cluster constraint.
+        Users cannot use cluster_sdp and cluster_ip at the same time, when a value
+        is assigned to cluster_sdp automatically cluster_ip becomes None.
+        This constraint is based on :cite:`a-Cajas10` and :cite:`a-Cajas11`.
+        The default is None.
+    network_ip : nd-array, optional
+        Connection matrix for integer programming (IP) network constraint. Users
+        cannot use network_sdp and network_ip at the same time, when a value is
+        assigned to network_ip automatically network_sdp becomes None.
+        This constraint is based on :cite:`a-Cajas10` and :cite:`a-Cajas11`.
+        The default is None.
+    cluster_ip : nd-array, optional
+        Adjacency label matrix for integer programming (IP) cluster constraint. Users
+        cannot use cluster_sdp and cluster_ip at the same time, when a value is
+        assigned to cluster_ip automatically cluster_sdp becomes None.
+        This constraint is based on :cite:`a-Cajas10` and :cite:`a-Cajas11`.
+        The default is None.
+    graph_penalty : float, optional
+        The weight of SDP network constraint when the risk measure is not 'MV'.
+        This constraint is based on :cite:`a-Cajas10` and :cite:`a-Cajas11`.
+        The default is 0.05.
+    acentrality : nd-array, optional
+        The matrix :math:`A_c` of the centrality constraint :math:`A_c = B_c`.
+        This constraint is based on :cite:`a-Cajas10`.
+        The default is None.
+    bcentrality : nd-array, optional
+        The matrix :math:`B_c` of the centrality constraint :math:`A_c = B_c`.
+        This constraint is based on :cite:`a-Cajas10`.
         The default is None.
     lowerret : float, optional
         Constraint on min level of expected return. The default is None.
     upperdev : float, optional
         Constraint on max level of standard deviation. The default is None.
+    lowerskew : float, optional
+        Constraint on min level of skewness. The default is None.
     upperkt : float, optional
         Constraint on max level of square root kurtosis. The default is None.
     uppermad : float, optional
@@ -120,11 +226,13 @@ class Portfolio(object):
         Constraint on max level of second lower partial moment.
         The default is None.
     upperCVaR : float, optional
-        Constraint on max level of CVaR. The default is None.
+        Constraint on max level of conditional value at risk (CVaR). The default is None.
     uppertg : float, optional
         Constraint on max level of Tail Gini. The default is None.
     upperEVaR : float, optional
-        Constraint on max level of EVaR. The default is None.
+        Constraint on max level of entropic value at risk (EVaR). The default is None.
+    upperRLVaR : float, optional
+        Constraint on max level of relativistic value at risk (RLVaR). The default is None.
     upperwr : float, optional
         Constraint on max level of worst realization. The default is None.
     upperrg : float, optional
@@ -133,6 +241,10 @@ class Portfolio(object):
         Constraint on max level of CVaR range. The default is None.
     uppertgrg : float, optional
         Constraint on max level of Tail Gini range. The default is None.
+    upperevrg : float, optional
+        Constraint on max level of EVaR range. The default is None.
+    upperrvrg : float, optional
+        Constraint on max level of RLVaR range. The default is None.
     uppermdd : float, optional
         Constraint on max level of maximum drawdown of uncompounded cumulative
         returns. The default is None.
@@ -145,9 +257,26 @@ class Portfolio(object):
     upperEDaR : float, optional
         Constraint on max level of entropic drawdown at risk (EDaR) of
         uncompounded cumulative returns. The default is None.
+    upperRLDaR : float, optional
+        Constraint on max level of relativistic drawdown at risk (RLDaR) of
+        uncompounded cumulative returns. The default is None.
     upperuci : float, optional
         Constraint on max level of ulcer index (UCI) of
         uncompounded cumulative returns. The default is None.
+    p_1 : float, optional
+        First p-norm used to approximate GMD, TG and TGRG. The default is 2.
+    p_2 : float, optional
+        Second p-norm used to approximate GMD, TG and TGRG. The default is 3.
+    p_3 : float, optional
+        Third p-norm used to approximate GMD, TG and TGRG. The default is 4.
+    p_4 : float, optional
+        Fourth p-norm used to approximate GMD, TG and TGRG. The default is 10.
+    p_5 : float, optional
+        Fifth p-norm used to approximate GMD, TG and TGRG. The default is 50.
+    p_em : int, optional
+        Order of the Even Moment of order 2 * p_em. It must be an integer higher equal than 2. The default value is 2.
+    p_esm : int, optional
+        Order of the Even Semi Moment of order 2 * p_esm. It must be an integer higher equal than 2. The default value is 2.
     """
 
     def __init__(
@@ -156,7 +285,9 @@ class Portfolio(object):
         sht=False,
         uppersht=0.2,
         upperlng=1,
+        lowerlng=0,
         budget=1,
+        budgetsht=0.2,
         nea=None,
         card=None,
         factors=None,
@@ -165,6 +296,8 @@ class Portfolio(object):
         a_sim=100,
         beta=None,
         b_sim=None,
+        kappa=0.30,
+        kappa_g=None,
         n_max_kurt=50,
         kindbench=True,
         allowTO=False,
@@ -175,8 +308,27 @@ class Portfolio(object):
         benchweights=None,
         ainequality=None,
         binequality=None,
+        arcinequality=None,
+        brcinequality=None,
+        afrcinequality=None,
+        bfrcinequality=None,
+        aintinequality=None,
+        bintinequality=None,
+        cintinequality=None,
+        dintinequality=None,
+        eintinequality=None,
+        fintinequality=None,
+        b=None,
+        network_sdp=None,
+        cluster_sdp=None,
+        network_ip=None,
+        cluster_ip=None,
+        graph_penalty=0.05,
+        acentrality=None,
+        bcentrality=None,
         lowerret=None,
         upperdev=None,
+        lowerskew=None,
         upperkt=None,
         uppermad=None,
         uppergmd=None,
@@ -187,24 +339,38 @@ class Portfolio(object):
         upperCVaR=None,
         uppertg=None,
         upperEVaR=None,
+        upperRLVaR=None,
         upperwr=None,
         uppercvrg=None,
         uppertgrg=None,
+        upperevrg=None,
+        upperrvrg=None,
         upperrg=None,
         uppermdd=None,
         upperadd=None,
         upperCDaR=None,
         upperEDaR=None,
+        upperRLDaR=None,
         upperuci=None,
+        upperem=None,
+        upperesm=None,
+        p_1=2,
+        p_2=3,
+        p_3=4,
+        p_4=10,
+        p_5=50,
+        p_em=2,
+        p_esm=2,
     ):
-
         # Optimization Models Options
 
         self._returns = returns
         self.sht = sht
         self.uppersht = uppersht
         self.upperlng = upperlng
+        self.lowerlng = lowerlng
         self.budget = budget
+        self.budgetsht = budgetsht
         self.nea = nea
         self.card = card
         self._factors = factors
@@ -212,13 +378,35 @@ class Portfolio(object):
         self.a_sim = a_sim
         self.beta = beta
         self.b_sim = b_sim
+        self._kappa = kappa
+        self._kappa_g = kappa_g
+        self.n_max_kurt = n_max_kurt
         self.kindbench = kindbench
         self.benchindex = benchindex
         self._benchweights = benchweights
         self._ainequality = ainequality
         self._binequality = binequality
+        self._arcinequality = arcinequality
+        self._brcinequality = brcinequality
+        self._afrcinequality = afrcinequality
+        self._bfrcinequality = bfrcinequality
+        self._aintinequality = aintinequality
+        self._bintinequality = bintinequality
+        self._cintinequality = cintinequality
+        self._dintinequality = dintinequality
+        self._eintinequality = eintinequality
+        self._fintinequality = fintinequality
+        self._b = b
+        self._network_sdp = network_sdp
+        self._cluster_sdp = cluster_sdp
+        self._network_ip = network_ip
+        self._cluster_ip = cluster_ip
+        self.graph_penalty = graph_penalty
+        self._acentrality = acentrality
+        self._bcentrality = bcentrality
         self.lowerret = lowerret
         self.upperdev = upperdev
+        self.lowerskew = lowerskew
         self.upperkt = upperkt
         self.uppermad = uppermad
         self.uppergmd = uppergmd
@@ -229,15 +417,28 @@ class Portfolio(object):
         self.upperCVaR = upperCVaR
         self.uppertg = uppertg
         self.upperEVaR = upperEVaR
+        self.upperRLVaR = upperRLVaR
         self.upperwr = upperwr
         self.uppercvrg = uppercvrg
         self.uppertgrg = uppertgrg
+        self.upperevrg = upperevrg
+        self.upperrvrg = upperrvrg
         self.upperrg = upperrg
         self.uppermdd = uppermdd
         self.upperadd = upperadd
         self.upperCDaR = upperCDaR
         self.upperEDaR = upperEDaR
+        self.upperRLDaR = upperRLDaR
         self.upperuci = upperuci
+        self.upperem = upperem
+        self.upperesm = upperesm
+        self.p_1 = p_1
+        self.p_2 = p_2
+        self.p_3 = p_3
+        self.p_4 = p_4
+        self.p_5 = p_5
+        self.p_em = p_em
+        self.p_esm = p_esm
 
         self.allowTO = allowTO
         self.turnover = turnover
@@ -248,23 +449,33 @@ class Portfolio(object):
 
         self.mu = None
         self.cov = None
+        self.skew = None
         self.kurt = None
         self.skurt = None
         self.L_2 = None
         self.S_2 = None
-        self.n_max_kurt = 50
         self.mu_f = None
         self.cov_f = None
         self._B = None
+        self.feature_selection = None
+        self.n_components = None
         self.mu_fm = None
         self.cov_fm = None
+        self.skew_fm = None
+        self.kurt_fm = None
         self.mu_bl = None
         self.cov_bl = None
         self.mu_bl_fm = None
         self.cov_bl_fm = None
         self.returns_fm = None
+        self.mu_ep = None
+        self.cov_ep = None
+        self.skew_ep = None
+        self.kurt_ep = None
         self.z_EVaR = None
         self.z_EDaR = None
+        self.z_RLVaR = None
+        self.z_RLDaR = None
 
         # Inputs of Worst Case Optimization Models
 
@@ -277,15 +488,17 @@ class Portfolio(object):
         self.k_sigma = None
 
         # Optimal portfolios
+
         self.optimal = None
         self.rp_optimal = None
+        self.rrp_optimal = None
         self.wc_optimal = None
         self.limits = None
         self.frontier = None
 
         # Solver params
 
-        self.solvers = ["ECOS", "SCS", "OSQP", "CVXOPT"]
+        self.solvers = ["CLARABEL", "ECOS", "SCS", "OSQP", "CVXOPT"]
         self.sol_params = {
             # 'ECOS': {"max_iters": 500, "abstol": 1e-8},
             # 'SCS': {"max_iters": 2500, "eps": 1e-5},
@@ -330,7 +543,7 @@ class Portfolio(object):
             if self.returns.index.equals(a.index):
                 self._factors = a
         else:
-            raise NameError("factors must be a DataFrame")
+            raise NameError("factors must be a DataFrame.")
 
     @property
     def factorslist(self):
@@ -348,8 +561,10 @@ class Portfolio(object):
         a = value
         if a is not None and isinstance(a, pd.DataFrame):
             self._B = a
+        elif a is None:
+            self._B = a
         else:
-            raise NameError("loadings matrix must be a DataFrame")
+            raise NameError("Loadings matrix must be a DataFrame.")
 
     @property
     def benchweights(self):
@@ -358,7 +573,7 @@ class Portfolio(object):
             if self._benchweights.shape[0] == n and self._benchweights.shape[1] == 1:
                 a = self._benchweights
             else:
-                raise NameError("Weights must have a size of shape (n_assets,1)")
+                raise NameError("Weights must have a size of shape (n_assets, 1).")
         else:
             a = np.array(np.ones((n, 1)) / n)
         return a
@@ -371,7 +586,7 @@ class Portfolio(object):
             if a.shape[0] == n and a.shape[1] == 1:
                 a = a
             else:
-                raise NameError("Weights must have a size of shape (n_assets,1)")
+                raise NameError("Weights must have a size of shape (n_assets,1).")
         else:
             a = np.array(np.ones((n, 1)) / n)
         self._benchweights = a
@@ -384,7 +599,7 @@ class Portfolio(object):
                 a = a
             else:
                 raise NameError(
-                    "The array ainequality must have the same number of columns that assets' number"
+                    "The matrix ainequality must have the same number of columns than assets' number."
                 )
         return a
 
@@ -396,7 +611,7 @@ class Portfolio(object):
                 a = a
             else:
                 raise NameError(
-                    "The matrix ainequality must have the same number of columns that assets' number"
+                    "The matrix ainequality must have the same number of columns than assets' number."
                 )
         self._ainequality = a
 
@@ -407,7 +622,7 @@ class Portfolio(object):
             if a.shape[1] == 1:
                 a = a
             else:
-                raise NameError("The matrix binequality must have one column")
+                raise NameError("The matrix binequality must have one column.")
         return a
 
     @binequality.setter
@@ -417,11 +632,535 @@ class Portfolio(object):
             if a.shape[1] == 1:
                 a = a
             else:
-                raise NameError("The matrix binequality must have one column")
+                raise NameError("The matrix binequality must have one column.")
         self._binequality = a
 
+    @property
+    def arcinequality(self):
+        a = self._arcinequality
+        if a is not None:
+            if a.shape[1] == self.numassets:
+                a = a
+            else:
+                raise NameError(
+                    "The matrix arcinequality must have the same number of columns than assets' number."
+                )
+        return a
+
+    @arcinequality.setter
+    def arcinequality(self, value):
+        a = value
+        if a is not None:
+            if a.shape[1] == self.numassets:
+                a = a
+            else:
+                raise NameError(
+                    "The matrix arcinequality must have the same number of columns than assets' number."
+                )
+        self._arcinequality = a
+
+    @property
+    def brcinequality(self):
+        a = self._brcinequality
+        if a is not None:
+            if a.shape[1] == 1:
+                a = a
+            else:
+                raise NameError("The matrix brcinequality must have one column.")
+        return a
+
+    @brcinequality.setter
+    def brcinequality(self, value):
+        a = value
+        if a is not None:
+            if a.shape[1] == 1:
+                a = a
+            else:
+                raise NameError("The matrix brcinequality must have one column.")
+        self._brcinequality = a
+
+    @property
+    def afrcinequality(self):
+        a = self._afrcinequality
+        if a is not None:
+            if a.shape[1] == len(self.factorslist):
+                a = a
+            else:
+                raise NameError(
+                    "The array afrcinequality must have the same number of columns than assets' number."
+                )
+        return a
+
+    @afrcinequality.setter
+    def afrcinequality(self, value):
+        a = value
+        if a is not None:
+            if a.shape[1] == len(self.factorslist):
+                a = a
+            else:
+                raise NameError(
+                    "The matrix afrcinequality must have the same number of columns than factors' number."
+                )
+        self._afrcinequality = a
+
+    @property
+    def bfrcinequality(self):
+        a = self._bfrcinequality
+        if a is not None:
+            if a.shape[1] == 1:
+                a = a
+            else:
+                raise NameError("The matrix bfrcinequality must have one column.")
+        return a
+
+    @bfrcinequality.setter
+    def bfrcinequality(self, value):
+        a = value
+        if a is not None:
+            if a.shape[1] == 1:
+                a = a
+            else:
+                raise NameError("The matrix bfrcinequality must have one column.")
+        self._bfrcinequality = a
+
+    ############
+
+    @property
+    def aintinequality(self):
+        a = self._aintinequality
+        if a is not None:
+            if isinstance(a, dict):
+                for key in a.keys():
+                    if min(a[key].shape) > 0:
+                        if a[key].shape[1] == self.numassets:
+                            a[key] = a[key]
+                        else:
+                            raise NameError(
+                                "The non-empty components of aintinequality must have the same number of columns than assets' number."
+                            )
+            else:
+                raise NameError("aintinequality must be a dictionary.")
+        return a
+
+    @aintinequality.setter
+    def aintinequality(self, value):
+        a = value
+        if a is not None:
+            if isinstance(a, dict):
+                for key in a.keys():
+                    if min(a[key].shape) > 0:
+                        if a[key].shape[1] == self.numassets:
+                            a[key] = a[key]
+                        else:
+                            raise NameError(
+                                "The non-empty components of aintinequality must have the same number of columns than assets' number."
+                            )
+            else:
+                raise NameError("aintinequality must be a dictionary.")
+        self._aintinequality = a
+
+    @property
+    def bintinequality(self):
+        a = self._bintinequality
+        if a is not None:
+            if isinstance(a, dict):
+                for key in a.keys():
+                    if min(a[key].shape) > 0:
+                        if a[key].shape[1] == 1:
+                            a[key] = a[key]
+                        else:
+                            raise NameError(
+                                "The non-empty components of bintinequality must have one column."
+                            )
+            else:
+                raise NameError("bintinequality must be a dictionary.")
+        return a
+
+    @bintinequality.setter
+    def bintinequality(self, value):
+        a = value
+        if a is not None:
+            if isinstance(a, dict):
+                for key in a.keys():
+                    if min(a[key].shape) > 0:
+                        if a[key].shape[1] == 1:
+                            a[key] = a[key]
+                        else:
+                            raise NameError(
+                                "The non-empty components of bintinequality must have one column."
+                            )
+            else:
+                raise NameError("bintinequality must be a dictionary.")
+        self._bintinequality = a
+
+    @property
+    def cintinequality(self):
+        a = self._cintinequality
+        if a is not None:
+            if isinstance(a, dict):
+                for key in a.keys():
+                    if min(a[key].shape) > 0:
+                        if a[key].shape[1] == self.numassets:
+                            a[key] = a[key]
+                        else:
+                            raise NameError(
+                                "The matrix cintinequality must have the same number of columns than assets' number."
+                            )
+            else:
+                raise NameError("cintinequality must be a dictionary.")
+        return a
+
+    @cintinequality.setter
+    def cintinequality(self, value):
+        a = value
+        if a is not None:
+            if isinstance(a, dict):
+                for key in a.keys():
+                    if min(a[key].shape) > 0:
+                        if a[key].shape[1] == self.numassets:
+                            a[key] = a[key]
+                        else:
+                            raise NameError(
+                                "The non-empty components of cintinequality must have the same number of columns than assets' number."
+                            )
+            else:
+                raise NameError("cintinequality must be a dictionary.")
+        self._cintinequality = a
+
+    @property
+    def dintinequality(self):
+        a = self._dintinequality
+        if a is not None:
+            if isinstance(a, dict):
+                for key in a.keys():
+                    if min(a[key].shape) > 0:
+                        if a[key].shape[1] == 1:
+                            a[key] = a[key]
+                        else:
+                            raise NameError(
+                                "The non-empty components of dintinequality must have one column."
+                            )
+            else:
+                raise NameError("dintinequality must be a dictionary.")
+        return a
+
+    @dintinequality.setter
+    def dintinequality(self, value):
+        a = value
+        if a is not None:
+            if isinstance(a, dict):
+                for key in a.keys():
+                    if min(a[key].shape) > 0:
+                        if a[key].shape[1] == 1:
+                            a[key] = a[key]
+                        else:
+                            raise NameError(
+                                "The non-empty components of dintinequality must have one column."
+                            )
+            else:
+                raise NameError("dintinequality must be a dictionary.")
+        self._dintinequality = a
+
+    @property
+    def eintinequality(self):
+        a = self._eintinequality
+        if a is not None:
+            if isinstance(a, dict):
+                for key in a.keys():
+                    if min(a[key].shape) > 0:
+                        if a[key].shape[1] >= 2:
+                            a[key] = a[key]
+                        else:
+                            raise NameError(
+                                "The non-empty components of eintinequality must have at least two columns."
+                            )
+            else:
+                raise NameError("eintinequality must be a dictionary.")
+        return a
+
+    @eintinequality.setter
+    def eintinequality(self, value):
+        a = value
+        if a is not None:
+            if isinstance(a, dict):
+                for key in a.keys():
+                    if min(a[key].shape) > 0:
+                        if a[key].shape[1] >= 2:
+                            a[key] = a[key]
+                        else:
+                            raise NameError(
+                                "The non-empty components of eintinequality must have at least two columns."
+                            )
+            else:
+                raise NameError("eintinequality must be a dictionary.")
+        self._eintinequality = a
+
+    @property
+    def fintinequality(self):
+        a = self._fintinequality
+        if a is not None:
+            if isinstance(a, dict):
+                for key in a.keys():
+                    if min(a[key].shape) > 0:
+                        if a[key].shape[1] == 1:
+                            a[key] = a[key]
+                        else:
+                            raise NameError(
+                                "The non-empty components of fintinequality must have one column."
+                            )
+            else:
+                raise NameError("fintinequality must be a dictionary.")
+        return a
+
+    @fintinequality.setter
+    def fintinequality(self, value):
+        a = value
+        if a is not None:
+            if isinstance(a, dict):
+                for key in a.keys():
+                    if min(a[key].shape) > 0:
+                        if a[key].shape[1] == 1:
+                            a[key] = a[key]
+                        else:
+                            raise NameError(
+                                "The non-empty components of fintinequality must have one column."
+                            )
+            else:
+                raise NameError("fintinequality must be a dictionary.")
+        self._fintinequality = a
+
+    ############
+
+    @property
+    def b(self):
+        a = self._b
+        if a is not None:
+            if a.shape[0] == self.numassets and a.shape[1] == 1:
+                pass
+            elif a.shape[0] == 1 and a.shape[1] == self.numassets:
+                a = a.T
+            else:
+                raise NameError(
+                    "The vector of risk contribution constraints must have a size equal than the assets' number."
+                )
+        return a
+
+    @b.setter
+    def b(self, value):
+        a = value
+        if a is not None:
+            if a.shape[0] == self.numassets and a.shape[1] == 1:
+                pass
+            elif a.shape[0] == 1 and a.shape[1] == self.numassets:
+                a = a.T
+            else:
+                raise NameError(
+                    "The vector of risk contribution constraints must have a size equal than the assets' number."
+                )
+        self._b = a
+
+    @property
+    def network_sdp(self):
+        a = self._network_sdp
+        n = self.numassets
+        if self._network_sdp is not None:
+            if self._network_sdp.shape[0] == n and self._network_sdp.shape[1] == n:
+                a = self._network_sdp
+            else:
+                raise NameError(
+                    "Connection matrix network_sdp must have a size of shape (n_assets, n_assets)."
+                )
+        return a
+
+    @network_sdp.setter
+    def network_sdp(self, value):
+        a = value
+        n = self.numassets
+        if a is not None:
+            if a.shape[0] == n and a.shape[1] == n:
+                a = a
+            else:
+                raise NameError(
+                    "Connection matrix network_sdp must have a size of shape (n_assets, n_assets)."
+                )
+        self._network_sdp = a
+        self._network_ip = None
+        self.card = None
+
+    @property
+    def cluster_sdp(self):
+        a = self._cluster_sdp
+        n = self.numassets
+        if self._cluster_sdp is not None:
+            if self._cluster_sdp.shape[0] == n and self._cluster_sdp.shape[1] == n:
+                a = self._cluster_sdp
+            else:
+                raise NameError(
+                    "Connection matrix cluster_sdp must have a size of shape (n_assets, n_assets)."
+                )
+        return a
+
+    @cluster_sdp.setter
+    def cluster_sdp(self, value):
+        a = value
+        n = self.numassets
+        if a is not None:
+            if a.shape[0] == n and a.shape[1] == n:
+                a = a
+            else:
+                raise NameError(
+                    "Connection matrix cluster_sdp must have a size of shape (n_assets, n_assets)."
+                )
+        self._cluster_sdp = a
+        self._cluster_ip = None
+        self.card = None
+
+    @property
+    def network_ip(self):
+        a = self._network_ip
+        n = self.numassets
+        if a is not None:
+            if a.shape[1] == n:
+                a = a
+            else:
+                raise NameError(
+                    "Connection matrix network_ip must have a n_assets columns."
+                )
+        return a
+
+    @network_ip.setter
+    def network_ip(self, value):
+        a = value
+        n = self.numassets
+        if a is not None:
+            if a.shape[1] == n:
+                a = a
+            else:
+                raise NameError(
+                    "Connection matrix network_ip must have a n_assets columns."
+                )
+        self._network_ip = a
+        self._network_sdp = None
+
+    @property
+    def cluster_ip(self):
+        a = self._cluster_ip
+        n = self.numassets
+        if a is not None:
+            if a.shape[1] == n:
+                a = a
+            else:
+                raise NameError(
+                    "Connection matrix cluster_ip must have a n_assets columns."
+                )
+        return a
+
+    @cluster_ip.setter
+    def cluster_ip(self, value):
+        a = value
+        n = self.numassets
+        if a is not None:
+            if a.shape[1] == n:
+                a = a
+            else:
+                raise NameError(
+                    "Connection matrix cluster_ip must have a n_assets columns."
+                )
+        self._cluster_ip = a
+        self._cluster_sdp = None
+
+    @property
+    def acentrality(self):
+        a = self._acentrality
+        if a is not None:
+            if a.shape[1] == self.numassets:
+                a = a
+            else:
+                raise NameError(
+                    "The array ainequality must have the same number of columns than assets' number."
+                )
+        return a
+
+    @acentrality.setter
+    def acentrality(self, value):
+        a = value
+        if a is not None:
+            if a.shape[1] == self.numassets:
+                a = a
+            else:
+                raise NameError(
+                    "The matrix ainequality must have the same number of columns than assets' number."
+                )
+        self._acentrality = a
+
+    @property
+    def bcentrality(self):
+        a = self._bcentrality
+        if a is not None:
+            if a.shape[1] == 1:
+                a = a
+            else:
+                raise NameError("The matrix binequality must have one column.")
+        return a
+
+    @bcentrality.setter
+    def bcentrality(self, value):
+        a = value
+        if a is not None:
+            if a.shape[1] == 1:
+                a = a
+            else:
+                raise NameError("The matrix binequality must have one column.")
+        self._bcentrality = a
+
+    @property
+    def kappa(self):
+        return self._kappa
+
+    @kappa.setter
+    def kappa(self, value):
+        a = value
+        if a >= 1:
+            print(
+                "kappa must be between 0 and 1, values higher or equal to 1 are setting to 0.99."
+            )
+            self._kappa = 0.99
+        elif a <= 0:
+            print(
+                "kappa must be between 0 and 1, values lower or equal to 0 are setting to 0.01."
+            )
+            self._kappa = 0.01
+        else:
+            self._kappa = a
+
+    @property
+    def kappa_g(self):
+        return self._kappa_g
+
+    @kappa_g.setter
+    def kappa_g(self, value):
+        a = value
+        if a >= 1:
+            print(
+                "kappa must be between 0 and 1, values higher or equal to 1 are setting to 0.99."
+            )
+            self._kappa_g = 0.99
+        elif a <= 0:
+            print(
+                "kappa must be between 0 and 1, values lower or equal to 0 are setting to 0.01."
+            )
+            self._kappa_g = 0.01
+        else:
+            self._kappa_g = a
+
     def assets_stats(
-        self, method_mu="hist", method_cov="hist", method_kurt=None, d=0.94, **kwargs
+        self,
+        method_mu="hist",
+        method_cov="hist",
+        method_kurt=None,
+        dict_mu={},
+        dict_cov={},
+        dict_kurt={},
     ):
         r"""
         Calculate the inputs that will be used by the optimization method when
@@ -436,9 +1175,12 @@ class Portfolio(object):
             - 'hist': use historical estimates.
             - 'ewma1'': use ewma with adjust=True, see `EWM <https://pandas.pydata.org/pandas-docs/stable/user_guide/computation.html#exponentially-weighted-windows>`_ for more details.
             - 'ewma2': use ewma with adjust=False, see `EWM <https://pandas.pydata.org/pandas-docs/stable/user_guide/computation.html#exponentially-weighted-windows>`_ for more details.
+            - 'JS': James-Stein estimator. For more information see :cite:`a-Meucci2005` and :cite:`a-Feng2016`.
+            - 'BS': Bayes-Stein estimator. For more information see :cite:`a-Jorion1986`.
+            - 'BOP': BOP estimator. For more information see :cite:`a-Bodnar2019`.
 
         method_cov : str, optional
-            The method used to estimate the covariance matrix:
+            The method used to estimate the covariance matrix.
             The default is 'hist'. Possible values are:
 
             - 'hist': use historical estimates.
@@ -461,13 +1203,16 @@ class Portfolio(object):
 
             - None: do not calculate kurtosis square matrix.
             - 'hist': use historical estimates. For more information see :cite:`a-Cajas4`.
-            - 'semi': use semi cokurtosis square matrix. For more information see :cite:`a-Cajas4`.
             - 'fixed': denoise using fixed method. For more information see chapter 2 of :cite:`a-MLforAM`.
             - 'spectral': denoise using spectral method. For more information see chapter 2 of :cite:`a-MLforAM`.
             - 'shrink': denoise using shrink method. For more information see chapter 2 of :cite:`a-MLforAM`.
 
-        **kwargs : dict
-            All additional parameters of mean_vector and covar_matrix functions.
+        dict_mu : dict
+            Other variables related to the mean vector estimation method.
+        dict_cov : dict
+            Other variables related to the covariance estimation method.
+        dict_kurt : dict
+            Other variables related to the cokurtosis estimation method.
 
         See Also
         --------
@@ -477,14 +1222,15 @@ class Portfolio(object):
 
         """
 
-        self.mu = pe.mean_vector(self.returns, method=method_mu, d=d)
-        self.cov = pe.covar_matrix(self.returns, method=method_cov, **kwargs)
-        value = af.is_pos_def(self.cov, threshold=1e-8)
+        self.mu = pe.mean_vector(self.returns, method=method_mu, **dict_mu)
+        self.cov = pe.covar_matrix(self.returns, method=method_cov, **dict_cov)
+
+        value = af.is_pos_def(self.cov, threshold=1e-6)
         for i in range(5):
             if value == False:
                 try:
-                    self.cov = af.cov_fix(self.cov, method="clipped", threshold=1e-5)
-                    value = af.is_pos_def(self.cov, threshold=1e-8)
+                    self.cov = af.cov_fix(self.cov, method="clipped", threshold=1e-6)
+                    value = af.is_pos_def(self.cov, threshold=1e-6)
                 except:
                     break
             else:
@@ -493,48 +1239,63 @@ class Portfolio(object):
         if value == False:
             print("You must convert self.cov to a positive definite matrix")
 
-        if method_kurt not in [None, "semi"]:
-            T, N = self.returns.shape
-            self.L_2 = cf.duplication_elimination_matrix(N)
-            self.S_2 = cf.duplication_summation_matrix(N)
-            self.kurt = pe.cokurt_matrix(self.returns, method=method_kurt, **kwargs)
-            value = af.is_pos_def(self.kurt, threshold=1e-8)
-            for i in range(5):
-                if value == False:
-                    try:
-                        self.kurt = af.cov_fix(
-                            self.kurt, method="clipped", threshold=1e-5
-                        )
-                        value = af.is_pos_def(self.kurt, threshold=1e-8)
-                    except:
+        if method_kurt is not None:
+            if method_kurt == "semi":
+                raise ValueError(
+                    "method_kurt not support 'semi' value because semi cokurtosis matrix is calculated when cokurtosis matrix is calculated"
+                )
+            else:
+                T, N = self.returns.shape
+                self.L_2 = cf.duplication_elimination_matrix(N)
+                self.D_2 = cf.duplication_matrix(N)
+                self.S_2 = cf.duplication_summation_matrix(N)
+
+                # Calculate cokurtosis matrix
+
+                self.skew = cf.coskewness_matrix(self.returns)
+
+                self.kurt = pe.cokurt_matrix(
+                    self.returns, method=method_kurt, **dict_kurt
+                )
+                value = af.is_pos_def(self.kurt, threshold=1e-8)
+                for i in range(5):
+                    if value == False:
+                        try:
+                            self.kurt = af.cov_fix(
+                                self.kurt, method="clipped", threshold=1e-5
+                            )
+                            value = af.is_pos_def(self.kurt, threshold=1e-8)
+                        except:
+                            break
+                    else:
                         break
-                else:
-                    break
 
-            if value == False:
-                print("You must convert self.kurt to a positive definite matrix")
-
-            self.skurt = pe.cokurt_matrix(self.returns, method="semi")
-            value = af.is_pos_def(self.skurt, threshold=1e-8)
-            for i in range(5):
                 if value == False:
-                    try:
-                        self.skurt = af.cov_fix(
-                            self.skurt, method="clipped", threshold=1e-5
-                        )
-                        value = af.is_pos_def(self.skurt, threshold=1e-8)
-                    except:
-                        break
-                else:
-                    break
+                    print("You must convert self.kurt to a positive definite matrix")
 
-            if value == False:
-                print("You must convert self.skurt to a positive definite matrix")
+                self.skurt = pe.cokurt_matrix(self.returns, method="semi")
+                value = af.is_pos_def(self.skurt, threshold=1e-6)
+                for i in range(5):
+                    if value == False:
+                        try:
+                            self.skurt = af.cov_fix(
+                                self.skurt, method="clipped", threshold=1e-6
+                            )
+                            value = af.is_pos_def(self.skurt, threshold=1e-6)
+                        except:
+                            break
+                    else:
+                        break
+
+                if value == False:
+                    print("You must convert self.skurt to a positive definite matrix")
 
         else:
+            self.skew = None
             self.kurt = None
             self.skurt = None
             self.L_2 = None
+            self.D_2 = None
             self.S_2 = None
 
     def blacklitterman_stats(
@@ -547,7 +1308,8 @@ class Portfolio(object):
         eq=True,
         method_mu="hist",
         method_cov="hist",
-        **kwargs,
+        dict_mu={},
+        dict_cov={},
     ):
         r"""
         Calculate the inputs that will be used by the optimization method when
@@ -576,9 +1338,11 @@ class Portfolio(object):
             - 'hist': use historical estimates.
             - 'ewma1'': use ewma with adjust=True, see `EWM <https://pandas.pydata.org/pandas-docs/stable/user_guide/computation.html#exponentially-weighted-windows>`_ for more details.
             - 'ewma2': use ewma with adjust=False, see `EWM <https://pandas.pydata.org/pandas-docs/stable/user_guide/computation.html#exponentially-weighted-windows>`_ for more details.
-
+            - 'JS': James-Stein estimator. For more information see :cite:`a-Meucci2005` and :cite:`a-Feng2016`.
+            - 'BS': Bayes-Stein estimator. For more information see :cite:`a-Jorion1986`.
+            - 'BOP': BOP estimator. For more information see :cite:`a-Bodnar2019`.
         method_cov : str, optional
-            The method used to estimate the covariance matrix:
+            The method used to estimate the covariance matrix.
             The default is 'hist'. Possible values are:
 
             - 'hist': use historical estimates.
@@ -594,8 +1358,10 @@ class Portfolio(object):
             - 'shrink': denoise using shrink method. For more information see chapter 2 of :cite:`a-MLforAM`.
             - 'gerber1': use the Gerber statistic 1. For more information see: :cite:`a-Gerber2021`.
             - 'gerber2': use the Gerber statistic 2. For more information see: :cite:`a-Gerber2021`.
-        **kwargs : dict
-            Other variables related to the covariance estimation.
+        dict_mu : dict
+            Other variables related to the mean vector estimation method.
+        dict_cov : dict
+            Other variables related to the covariance estimation method.
 
         See Also
         --------
@@ -625,19 +1391,20 @@ class Portfolio(object):
             eq=eq,
             method_mu=method_mu,
             method_cov=method_cov,
-            **kwargs,
+            dict_mu=dict_mu,
+            dict_cov=dict_cov,
         )
         self.mu_bl = mu
         self.cov_bl = cov
 
-        value = af.is_pos_def(self.cov_bl, threshold=1e-8)
+        value = af.is_pos_def(self.cov_bl, threshold=1e-6)
         for i in range(5):
             if value == False:
                 try:
                     self.cov_bl = af.cov_fix(
-                        self.cov_bl, method="clipped", threshold=1e-5
+                        self.cov_bl, method="clipped", threshold=1e-6
                     )
-                    value = af.is_pos_def(self.cov_bl, threshold=1e-8)
+                    value = af.is_pos_def(self.cov_bl, threshold=1e-6)
                 except:
                     break
             else:
@@ -650,10 +1417,14 @@ class Portfolio(object):
         self,
         method_mu="hist",
         method_cov="hist",
-        d=0.94,
+        method_kurt="hist",
         B=None,
+        const=True,
+        higher_comoments=False,
+        dict_load={},
+        dict_mu={},
         dict_cov={},
-        dict_risk={},
+        dict_kurt={},
     ):
         r"""
         Calculate the inputs that will be used by the optimization method when
@@ -668,9 +1439,11 @@ class Portfolio(object):
             - 'hist': use historical estimates.
             - 'ewma1'': use ewma with adjust=True, see `EWM <https://pandas.pydata.org/pandas-docs/stable/user_guide/computation.html#exponentially-weighted-windows>`_ for more details.
             - 'ewma2': use ewma with adjust=False, see `EWM <https://pandas.pydata.org/pandas-docs/stable/user_guide/computation.html#exponentially-weighted-windows>`_ for more details.
-
+            - 'JS': James-Stein estimator. For more information see :cite:`a-Meucci2005` and :cite:`a-Feng2016`.
+            - 'BS': Bayes-Stein estimator. For more information see :cite:`a-Jorion1986`.
+            - 'BOP': BOP estimator. For more information see :cite:`a-Bodnar2019`.
         method_cov : str, optional
-            The method used to estimate the covariance matrix:
+            The method used to estimate the covariance matrix.
             The default is 'hist'. Possible values are:
 
             - 'hist': use historical estimates.
@@ -686,10 +1459,30 @@ class Portfolio(object):
             - 'shrink': denoise using shrink method. For more information see chapter 2 of :cite:`a-MLforAM`.
             - 'gerber1': use the Gerber statistic 1. For more information see: :cite:`a-Gerber2021`.
             - 'gerber2': use the Gerber statistic 2. For more information see: :cite:`a-Gerber2021`.
+        method_kurt : str, optional
+            The method used to estimate the cokurtosis square matrix:
+            The default is 'hist'. Possible values are:
+
+            - 'hist': use historical estimates.
+            - 'semi': use semi lower cokurtosis square matrix.
+            - 'fixed': denoise using fixed method. For more information see chapter 2 of :cite:`b-MLforAM`.
+            - 'spectral': denoise using spectral method. For more information see chapter 2 of :cite:`b-MLforAM`.
+            - 'shrink': denoise using shrink method. For more information see chapter 2 of :cite:`b-MLforAM`.
+        B : DataFrame of shape (n_assets, n_factors), optional
+            Loadings matrix, where the number of rows represent the assets and the
+            columns the risk factors. If is not specified, is estimated using
+            stepwise regression. The default is None.
+        const : bool, optional
+            Indicate if the loadings matrix has a constant.
+            The default is False.
+        dict_load : dict
+            Other variables related to the loadings matrix estimation.
+        dict_mu : dict
+            Other variables related to the mean vector estimation method.
         dict_cov : dict
-            Other variables related to the covariance estimation.
-        dict_risk : dict
-            Other variables related of risk_factors function.
+            Other variables related to the covariance estimation method.
+        dict_kurt : dict
+            Other variables related to the cokurtosis estimation.
 
         See Also
         --------
@@ -702,38 +1495,73 @@ class Portfolio(object):
         X = self.factors
         Y = self.returns
 
-        mu_f = pe.mean_vector(self.returns, method=method_mu, d=d)
-        cov_f = pe.covar_matrix(self.returns, method=method_cov, d=d, **dict_cov)
+        mu_f = pe.mean_vector(self.factors, method=method_mu, **dict_mu)
+        cov_f = pe.covar_matrix(self.factors, method=method_cov, **dict_cov)
 
         self.mu_f = mu_f
         self.cov_f = cov_f
 
-        value = af.is_pos_def(self.cov_f, threshold=1e-8)
+        value = af.is_pos_def(self.cov_f, threshold=1e-6)
         if value == False:
             try:
-                self.cov = af.cov_fix(self.cov, method="clipped", threshold=1e-5)
-                value = af.is_pos_def(self.cov, threshold=1e-8)
+                self.cov = af.cov_fix(self.cov, method="clipped", threshold=1e-6)
+                value = af.is_pos_def(self.cov, threshold=1e-6)
                 if value == False:
                     print("You must convert self.cov to a positive definite matrix")
             except:
                 print("You must convert self.cov to a positive definite matrix")
 
-        mu, cov, returns = pe.risk_factors(
-            X, Y, B=B, method_mu=method_mu, method_cov=method_cov, **dict_risk
+        if B is None:
+            if self.B is None:
+                self.B = pe.loadings_matrix(X=X, Y=Y, **dict_load)
+                const = True
+                self.feature_selection = None
+                self.n_components = 0.95
+                if "feature_selection" in dict_load:
+                    if dict_load["feature_selection"] == "PCR":
+                        self.feature_selection = "PCR"
+                if "n_components" in dict_load:
+                    self.n_components = dict_load["n_components"]
+            elif self.B is not None:
+                self.feature_selection = None
+        elif B is not None:
+            self.B = B
+
+        mu, cov, returns, B_, skew, kurt = pe.risk_factors(
+            X,
+            Y,
+            B=self.B,
+            const=const,
+            method_mu=method_mu,
+            method_cov=method_cov,
+            method_kurt=method_kurt,
+            higher_comoments=higher_comoments,
+            dict_mu=dict_mu,
+            dict_cov=dict_cov,
+            dict_kurt=dict_kurt,
         )
 
         self.mu_fm = mu
         self.cov_fm = cov
+        self.skew_fm = skew
+        self.kurt_fm = kurt
         self.returns_fm = returns
 
-        value = af.is_pos_def(self.cov_fm, threshold=1e-8)
+        if B_.shape[1] == len(self.factorslist):
+            self.B = pd.DataFrame(B_, index=self.assetslist, columns=self.factorslist)
+        else:
+            self.B = pd.DataFrame(
+                B_, index=self.assetslist, columns=["const"] + self.factorslist
+            )
+
+        value = af.is_pos_def(self.cov_fm, threshold=1e-6)
         for i in range(5):
             if value == False:
                 try:
                     self.cov_fm = af.cov_fix(
-                        self.cov_fm, method="clipped", threshold=1e-5
+                        self.cov_fm, method="clipped", threshold=1e-6
                     )
-                    value = af.is_pos_def(self.cov_fm, threshold=1e-8)
+                    value = af.is_pos_def(self.cov_fm, threshold=1e-6)
                 except:
                     break
             else:
@@ -741,6 +1569,23 @@ class Portfolio(object):
 
         if value == False:
             print("You must convert self.cov_fm to a positive definite matrix")
+
+        if higher_comoments:
+            value = af.is_pos_def(self.kurt_fm, threshold=1e-6)
+            for i in range(5):
+                if value == False:
+                    try:
+                        self.kurt_fm = af.cov_fix(
+                            self.kurt_fm, method="clipped", threshold=1e-6
+                        )
+                        value = af.is_pos_def(self.kurt_fm, threshold=1e-6)
+                    except:
+                        break
+                else:
+                    break
+
+            if value == False:
+                print("You must convert self.kurt_fm to a positive definite matrix")
 
     def blfactors_stats(
         self,
@@ -754,12 +1599,12 @@ class Portfolio(object):
         w=None,
         delta=None,
         eq=True,
-        const=False,
-        diag=False,
+        const=True,
         method_mu="hist",
         method_cov="hist",
-        kwargs_1=None,
-        kwargs_2=None,
+        dict_load={},
+        dict_mu={},
+        dict_cov={},
     ):
         r"""
         Calculate the inputs that will be used by the optimization method when
@@ -793,11 +1638,6 @@ class Portfolio(object):
         const : bool, optional
             Indicate if the loadings matrix has a constant.
             The default is False.
-        diag : bool, optional
-            Indicate if we use the diagonal matrix to calculate covariance matrix
-            of factor model, only useful when we work with a factor model based on
-            a regresion model (only equity portfolio).
-            The default is False.
         method_mu : str, optional
             The method used to estimate the expected returns.
             The default value is 'hist'. Possible values are:
@@ -805,7 +1645,9 @@ class Portfolio(object):
             - 'hist': use historical estimates.
             - 'ewma1'': use ewma with adjust=True, see `EWM <https://pandas.pydata.org/pandas-docs/stable/user_guide/computation.html#exponentially-weighted-windows>`_ for more details.
             - 'ewma2': use ewma with adjust=False, see `EWM <https://pandas.pydata.org/pandas-docs/stable/user_guide/computation.html#exponentially-weighted-windows>`_ for more details.
-
+            - 'JS': James-Stein estimator. For more information see :cite:`a-Meucci2005` and :cite:`a-Feng2016`.
+            - 'BS': Bayes-Stein estimator. For more information see :cite:`a-Jorion1986`.
+            - 'BOP': BOP estimator. For more information see :cite:`a-Bodnar2019`.
         method_cov : str, optional
             The method used to estimate the covariance matrix:
             The default is 'hist'. Possible values are:
@@ -823,10 +1665,12 @@ class Portfolio(object):
             - 'shrink': denoise using shrink method. For more information see chapter 2 of :cite:`a-MLforAM`.
             - 'gerber1': use the Gerber statistic 1. For more information see: :cite:`a-Gerber2021`.
             - 'gerber2': use the Gerber statistic 2. For more information see: :cite:`a-Gerber2021`.
-        kwargs_1 : dict
+        dict_load : dict
             Other variables related to the loadings matrix estimation.
-        kwargs_2 : dict
-            Other variables related to the factors Black Litterman model selected.
+        dict_mu : dict
+            Other variables related to the mean vector estimation method.
+        dict_cov : dict
+            Other variables related to the covariance estimation method.
 
         See Also
         --------
@@ -851,7 +1695,7 @@ class Portfolio(object):
 
         if B is None:
             if self.B is None:
-                self.B = pe.loadings_matrix(X=F, Y=X, **kwargs_1)
+                self.B = pe.loadings_matrix(X=F, Y=X, **dict_load)
                 const = True
             elif self.B is not None:
                 pass
@@ -859,86 +1703,52 @@ class Portfolio(object):
             self.B = B
 
         if flavor == "BLB":
-            if isinstance(kwargs_1, dict):
-                mu, cov, w = pe.black_litterman_bayesian(
-                    X=X,
-                    F=F,
-                    B=self.B,
-                    P_f=P_f,
-                    Q_f=Q_f,
-                    delta=delta,
-                    rf=rf,
-                    eq=eq,
-                    const=const,
-                    diag=diag,
-                    method_mu=method_mu,
-                    method_cov=method_cov,
-                    **kwargs_2,
-                )
-            else:
-                mu, cov, w = pe.black_litterman_bayesian(
-                    X=X,
-                    F=F,
-                    B=self.B,
-                    P_f=P_f,
-                    Q_f=Q_f,
-                    delta=delta,
-                    rf=rf,
-                    eq=eq,
-                    const=const,
-                    diag=diag,
-                    method_mu=method_mu,
-                    method_cov=method_cov,
-                )
+            mu, cov, w = pe.black_litterman_bayesian(
+                X=X,
+                F=F,
+                B=self.B,
+                P_f=P_f,
+                Q_f=Q_f,
+                delta=delta,
+                rf=rf,
+                const=const,
+                method_mu=method_mu,
+                method_cov=method_cov,
+                dict_mu=dict_mu,
+                dict_cov=dict_cov,
+            )
 
         elif flavor == "ABL":
-            if isinstance(kwargs_1, dict):
-                mu, cov, w = pe.augmented_black_litterman(
-                    X=X,
-                    w=w,
-                    F=F,
-                    B=self.B,
-                    P=P,
-                    Q=Q,
-                    P_f=P_f,
-                    Q_f=Q_f,
-                    delta=delta,
-                    rf=rf,
-                    eq=eq,
-                    const=const,
-                    method_mu=method_mu,
-                    method_cov=method_cov,
-                    **kwargs_2,
-                )
-            else:
-                mu, cov, w = pe.augmented_black_litterman(
-                    X=X,
-                    w=w,
-                    F=F,
-                    B=self.B,
-                    P=P,
-                    Q=Q,
-                    P_f=P_f,
-                    Q_f=Q_f,
-                    delta=delta,
-                    rf=rf,
-                    eq=eq,
-                    const=const,
-                    method_mu=method_mu,
-                    method_cov=method_cov,
-                )
+            mu, cov, w = pe.augmented_black_litterman(
+                X=X,
+                w=w,
+                F=F,
+                B=self.B,
+                P=P,
+                Q=Q,
+                P_f=P_f,
+                Q_f=Q_f,
+                delta=delta,
+                rf=rf,
+                eq=eq,
+                const=const,
+                method_mu=method_mu,
+                method_cov=method_cov,
+                dict_mu=dict_mu,
+                dict_cov=dict_cov,
+            )
 
         self.mu_bl_fm = mu
         self.cov_bl_fm = cov
 
-        value = af.is_pos_def(self.cov_bl_fm, threshold=1e-8)
+        value = af.is_pos_def(self.cov_bl_fm, threshold=1e-6)
         for i in range(5):
             if value == False:
                 try:
                     self.cov_bl_fm = af.cov_fix(
-                        self.cov_bl_fm, method="clipped", threshold=1e-5
+                        self.cov_bl_fm, method="clipped", threshold=1e-6
                     )
-                    value = af.is_pos_def(self.cov_bl_fm, threshold=1e-8)
+                    value = af.is_pos_def(self.cov_bl_fm, threshold=1e-6)
                 except:
                     break
             else:
@@ -947,6 +1757,57 @@ class Portfolio(object):
         if value == False:
             print("You must convert self.cov_bl_fm to a positive definite matrix")
 
+    def entropy_pooling_stats(
+        self,
+        P_eq: np.array = None,
+        Q_eq: np.array = None,
+        P_in: np.array = None,
+        Q_in: np.array = None,
+        higher_comoments: bool = False,
+        solver: str = "CLARABEL",
+    ):
+        r"""
+        Estimate the optimal scenario weights and comoments parameters using the
+        Entropy Pooling model. The Entropy Pooling model consist in solve the
+        following optimization problem:
+
+        Parameters
+        ----------
+        P_eq : np.array, optional
+            Matrix P of views that can be expressed as equality constraints.
+        Q_eq : np.array, optional
+            Matrix Q of views that can be expressed as equality constraints.
+        P_in : np.array, optional
+            Matrix P of views that can be expressed as inequality constraints.
+        Q_in : np.array, optional
+            Matrix Q of views that can be expressed as inequality constraints.
+        higher_comoments : bool, optional
+            If True calculate coskewness tensor and cokurtosis square matrix.
+        solver : str, optional
+            Solver used to solve the Entropy Pooling problem. The default value
+            is 'CLARABEL'.
+
+        See Also
+        --------
+        riskfolio.src.ParamsEstimation.entropy_pooling
+
+        """
+
+        mu_ep, cov_ep, skew_ep, kurt_ep, _ = pe.entropy_pooling(
+            self.returns,
+            P_eq=P_eq,
+            Q_eq=Q_eq,
+            P_in=P_in,
+            Q_in=Q_in,
+            higher_comoments=higher_comoments,
+            solver=solver,
+        )
+
+        self.mu_ep = mu_ep
+        self.cov_ep = cov_ep
+        self.skew_ep = skew_ep
+        self.kurt_ep = kurt_ep
+
     def wc_stats(
         self,
         box="s",
@@ -954,8 +1815,12 @@ class Portfolio(object):
         q=0.05,
         n_sim=3000,
         window=3,
+        diag=False,
+        threshold=1e-15,
         dmu=0.1,
         dcov=0.1,
+        method_k_mu="normal",
+        method_k_sigma="normal",
         seed=0,
     ):
         r"""
@@ -990,12 +1855,36 @@ class Portfolio(object):
             Block size of the bootstrapping method. Must be greather than 1
             and lower than the n_samples - n_features + 1
             The default is 3.
+        diag: bool
+            If consider only the main diagonal of covariance matrices of estimation
+            errors following :cite:`a-fabozzi2007robust`. The default is False.
+        threshold: float
+            Parameter used to fix covariance matrices in case they are not positive semidefinite.
+            The default is 1e-10.
         dmu : scalar
             Percentage used by delta method to increase and decrease the mean vector in box constraints.
             The default is 0.1.
         dcov : scalar
             Percentage used by delta method to increase and decrease the covariance matrix in box constraints.
             The default is 0.1.
+        method_k_mu : string or int or float
+            Method used to calculate the distance parameter of the elliptical uncertainty set of the mean.
+            The default is 'normal'. Possible values are:
+
+            - 'normal': assumes normal distribution of returns. Uses a bootstrapping method. :cite:`a-Yang2019` and :cite:`a-Tutuncu2004` .
+            - 'general': for any possible distribution of returns. Uses the ratio √((1-q)/q). :cite:`a-Fabozzi` and :cite:`a-ElGhaoui2003`.
+            - int or float value: we can use a custom distance parameter, that following lobo could be 1 or a near parameter. :cite:`a-Lobo`.
+
+        method_k_sigma : string or int or float
+            Method used to calculate the distance parameter of the elliptical uncertainty set of the covariance matrix.
+            The default is 'normal'. Possible values are:
+
+            - 'normal': assumes normal distribution of returns. Uses a bootstrapping method. :cite:`a-Yang2019` and :cite:`a-Tutuncu2004` .
+            - 'general': for any possible distribution of returns. Uses the ratio √((1-q)/q). :cite:`a-Fabozzi` and :cite:`a-ElGhaoui2003`.
+            - int or float value: we can use a custom distance parameter, that following lobo could be 1 or a near parameter. :cite:`a-Lobo`.
+
+        seed: int
+            Seed used to generate the boostrapping sample. The defailt is 0.
 
         See Also
         --------
@@ -1009,48 +1898,31 @@ class Portfolio(object):
             raise ValueError("box only can be 's', 'c', 'm' or 'n'")
 
         X = self.returns
-        cols = X.columns.tolist()
-        cols_2 = [i + "-" + j for i in cols for j in cols]
-        (T, N) = X.shape
-        mu = X.mean().to_frame().T
-        cov = X.cov()
 
         if box == "s":
-            mu_l, mu_u, cov_l, cov_u, _, _ = pe.bootstrapping(
+            mu_l, mu_u, cov_l, cov_u, _, _, _, _ = pe.bootstrapping(
                 X, kind="stationary", q=q, n_sim=n_sim, window=window, seed=seed
             )
             d_mu = (mu_u - mu_l) / 2
         elif box == "c":
-            mu_l, mu_u, cov_l, cov_u, _, _ = pe.bootstrapping(
+            mu_l, mu_u, cov_l, cov_u, _, _, _, _ = pe.bootstrapping(
                 X, kind="circular", q=q, n_sim=n_sim, window=window, seed=seed
             )
             d_mu = (mu_u - mu_l) / 2
         elif box == "m":
-            mu_l, mu_u, cov_l, cov_u, _, _ = pe.bootstrapping(
+            mu_l, mu_u, cov_l, cov_u, _, _, _, _ = pe.bootstrapping(
                 X, kind="moving", q=q, n_sim=n_sim, window=window, seed=seed
             )
             d_mu = (mu_u - mu_l) / 2
         elif box == "n":
-            # Defining confidence level of mean vector assuming normal returns
-            d_mu = st.norm.ppf(1 - q / 2) * np.sqrt(np.diag(cov) / T).reshape(1, -1)
-            d_mu = pd.DataFrame(d_mu, index=[0], columns=cols)
-
-            # Defining confidence level of covariance matrix assuming normal returns
-            rs = np.random.RandomState(seed=seed)
-            A = st.wishart.rvs(T, cov / T, size=10000, random_state=rs)
-            cov_l = np.percentile(A, q=q / 2, axis=0)
-            cov_u = np.percentile(A, q=1 - q / 2, axis=0)
-
-            cov_l = pd.DataFrame(cov_l, index=cols, columns=cols)
-            cov_u = pd.DataFrame(cov_u, index=cols, columns=cols)
-
-            if af.is_pos_def(cov_l) == False:
-                cov_l = af.cov_fix(cov_l, method="clipped", threshold=1e-3)
-
-            if af.is_pos_def(cov_u) == False:
-                cov_u = af.cov_fix(cov_u, method="clipped", threshold=1e-3)
-
+            mu_l, mu_u, cov_l, cov_u, _, _, _, _ = pe.normal_simulation(
+                X, q=q, n_sim=n_sim, diag=diag, threshold=threshold, seed=seed
+            )
+            d_mu = (mu_u - mu_l) / 2
         elif box == "d":
+            cols = X.columns.tolist()
+            mu = X.mean().to_frame().T
+            cov = X.cov()
             d_mu = dmu * np.abs(mu)
             cov_l = cov - dcov * np.abs(cov)
             cov_u = cov + dcov * np.abs(cov)
@@ -1059,100 +1931,120 @@ class Portfolio(object):
             cov_u = pd.DataFrame(cov_u, index=cols, columns=cols)
 
         if ellip == "s":
-            _, _, _, _, cov_mu, cov_sigma = pe.bootstrapping(
+            _, _, _, _, cov_mu, cov_sigma, k_mu, k_sigma = pe.bootstrapping(
                 X, kind="stationary", q=q, n_sim=n_sim, window=window, seed=seed
             )
         elif ellip == "c":
-            _, _, _, _, cov_mu, cov_sigma = pe.bootstrapping(
+            _, _, _, _, cov_mu, cov_sigma, k_mu, k_sigma = pe.bootstrapping(
                 X, kind="circular", q=q, n_sim=n_sim, window=window, seed=seed
             )
         elif ellip == "m":
-            _, _, _, _, cov_mu, cov_sigma = pe.bootstrapping(
+            _, _, _, _, cov_mu, cov_sigma, k_mu, k_sigma = pe.bootstrapping(
                 X, kind="moving", q=q, n_sim=n_sim, window=window, seed=seed
             )
         elif ellip == "n":
-            # Covariance of mean returns
-            cov_mu = cov / T
-            cov_mu = np.diag(np.diag(cov_mu))
-            cov_mu = pd.DataFrame(cov_mu, index=cols, columns=cols)
-            # Covariance of covariance matrix
-            K = af.commutation_matrix(cov)
-            I = np.identity(N * N)
-            cov_sigma = T * (I + K) @ np.kron(cov_mu, cov_mu)
-            cov_sigma = np.diag(np.diag(cov_sigma))
-            cov_sigma = pd.DataFrame(cov_sigma, index=cols_2, columns=cols_2)
-
-        k_mu = st.chi2.ppf(1 - q, df=N) ** 0.5
-        k_sigma = st.chi2.ppf(1 - q, df=N * N) ** 0.5
+            _, _, _, _, cov_mu, cov_sigma, k_mu, k_sigma = pe.normal_simulation(
+                X, q=q, n_sim=n_sim, diag=diag, threshold=threshold, seed=seed
+            )
 
         self.cov_l = cov_l
         self.cov_u = cov_u
         self.cov_mu = cov_mu
         self.cov_sigma = cov_sigma
         self.d_mu = d_mu
-        self.k_mu = k_mu
-        self.k_sigma = k_sigma
+
+        if method_k_mu == "normal":
+            self.k_mu = k_mu
+        elif method_k_mu == "general":
+            self.k_mu = np.sqrt((1 - q) / q)
+        elif isinstance(method_k_mu, float) or isinstance(method_k_mu, int):
+            self.k_mu = method_k_mu
+        else:
+            raise ValueError(
+                "The only available values of parameter method_k_mu are 'normal' and 'general' or a float or integer number"
+            )
+
+        if method_k_sigma == "normal":
+            self.k_sigma = k_sigma
+        elif method_k_sigma == "general":
+            self.k_sigma = np.sqrt((1 - q) / q)
+        elif isinstance(method_k_sigma, float) or isinstance(method_k_sigma, int):
+            self.k_mu = method_k_sigma
+        else:
+            raise ValueError(
+                "The only available values of parameter method_k_sigma are 'normal' and 'general' or a float or integer number"
+            )
 
     def optimization(
-        self, model="Classic", rm="MV", obj="Sharpe", kelly=False, rf=0, l=2, hist=True
+        self, model="Classic", rm="MV", obj="Sharpe", kelly=None, rf=0, l=2, hist=True
     ):
         r"""
         This method that calculates the optimal portfolio according to the
         optimization model selected by the user. The general problem that
         solves is:
-        
+
         .. math::
             \begin{align}
-            &\underset{w}{\text{optimize}} & & F(w)\\
-            &\text{s. t.} & & Aw \geq B\\
-            & & & \phi_{i}(w) \leq c_{i}\\
+            \underset{w}{\text{optimize}} & \quad F(w)\\
+            \text{s. t.} & \quad Aw \leq b\\
+            & \quad A RC(w) \leq b \sigma^{2}(w)\\
+            & \quad \phi_{i}(w) \leq c_{i}\\
             \end{align}
-        
+
         Where:
-            
+
         :math:`F(w)` is the objective function.
-    
-        :math:`Aw \geq B` is a set of linear constraints.
-    
+
+        :math:`Aw \leq b` is a set of linear constraints on asset weights.
+
+        :math:`A RC(w) \leq b \sigma^{2}(w)` is a set of linear risk contribution constraints for variance.
+
         :math:`\phi_{i}(w) \leq c_{i}` are constraints on maximum values of
         several risk measures.
-        
+
         Parameters
         ----------
-        model : str can be {'Classic', 'BL', 'FM' or 'BLFM'}
+        model : str can be {'Classic', 'BL', 'FM', 'BLFM', 'EP'}
             The model used for optimize the portfolio.
             The default is 'Classic'. Possible values are:
 
             - 'Classic': use estimates of expected return vector and covariance matrix that depends on historical data.
             - 'BL': use estimates of expected return vector and covariance matrix based on the Black Litterman model.
-            - 'FM': use estimates of expected return vector and covariance matrix based on a Risk Factor model specified by the user.
+            - 'FM': use estimates of expected return vector, covariance matrix and cokurtosis square matrix based on a Risk Factor model specified by the user.
             - 'BLFM': use estimates of expected return vector and covariance matrix based on Black Litterman applied to a Risk Factor model specified by the user.
-            
+            - 'EP': use estimates of expected return vector, covariance matrix and cokurtosis square matrix based on Entropy Pooling model.
+
         rm : str, optional
             The risk measure used to optimize the portfolio.
             The default is 'MV'. Possible values are:
-            
+
             - 'MV': Standard Deviation.
             - 'KT': Square Root of Kurtosis.
+            - 'EM': p_em Root of Even Moment of order 2 * p_em.
             - 'MAD': Mean Absolute Deviation.
             - 'GMD': Gini Mean Difference.
             - 'MSV': Semi Standard Deviation.
             - 'SKT': Square Root of Semi Kurtosis.
+            - 'ESM': p_esm Root of Even Semi Moment of order 2 * p_esm.
             - 'FLPM': First Lower Partial Moment (Omega Ratio).
             - 'SLPM': Second Lower Partial Moment (Sortino Ratio).
             - 'CVaR': Conditional Value at Risk.
             - 'TG': Tail Gini.
             - 'EVaR': Entropic Value at Risk.
+            - 'RLVaR': Relativistic Value at Risk. I recommend only use this function with MOSEK solver.
             - 'WR': Worst Realization (Minimax).
             - 'RG': Range of returns.
             - 'CVRG': CVaR range of returns.
             - 'TGRG': Tail Gini range of returns.
+            - 'EVRG': EVaR range of returns.
+            - 'RVRG': RLVaR range of returns. I recommend only use this function with MOSEK solver.
             - 'MDD': Maximum Drawdown of uncompounded cumulative returns (Calmar Ratio).
             - 'ADD': Average Drawdown of uncompounded cumulative returns.
             - 'CDaR': Conditional Drawdown at Risk of uncompounded cumulative returns.
             - 'EDaR': Entropic Drawdown at Risk of uncompounded cumulative returns.
+            - 'RLDaR': Relativistic Drawdown at Risk of uncompounded cumulative returns. I recommend only use this function with MOSEK solver.
             - 'UCI': Ulcer Index of uncompounded cumulative returns.
-            
+
         obj : str can be {'MinRisk', 'Utility', 'Sharpe' or 'MaxRet'}.
             Objective function of the optimization model.
             The default is 'Sharpe'. Possible values are:
@@ -1161,12 +2053,12 @@ class Portfolio(object):
             - 'Utility': Maximize the Utility function :math:`\mu w - l \phi_{i}(w)`.
             - 'Sharpe': Maximize the risk adjusted return ratio based on the selected risk measure.
             - 'MaxRet': Maximize the expected return of the portfolio.
-                
+
         kelly : str, optional
-            Method used to calculate mean return. Possible values are False for
-            arithmetic mean return, "approx" for approximate mean logarithmic 
+            Method used to calculate mean return. Possible values are: None for
+            arithmetic mean return, "approx" for approximate mean logarithmic
             return using first and second moment and "exact" for mean logarithmic
-            return. The default is False.
+            return. The default is None.
         rf : float, optional
             Risk free rate, must be in the same period of assets returns.
             The default is 0.
@@ -1187,7 +2079,7 @@ class Portfolio(object):
 
         Returns
         -------
-        w : DataFrame
+        optimal : DataFrame
             The weights of optimal portfolio.
 
         """
@@ -1196,18 +2088,25 @@ class Portfolio(object):
 
         mu = None
         sigma = None
+        kurt = None
         returns = None
         if model == "Classic":
             mu = np.array(self.mu, ndmin=2)
             sigma = np.array(self.cov, ndmin=2)
+            if self.kurt is not None:
+                kurt = np.array(self.kurt, ndmin=2)
             returns = np.array(self.returns, ndmin=2)
         elif model == "FM":
             mu = np.array(self.mu_fm, ndmin=2)
             if hist == False:
                 sigma = np.array(self.cov_fm, ndmin=2)
+                if self.kurt_fm is not None:
+                    kurt = np.array(self.kurt_fm, ndmin=2)
                 returns = np.array(self.returns_fm, ndmin=2)
             elif hist == True:
                 sigma = np.array(self.cov, ndmin=2)
+                if self.kurt is not None:
+                    kurt = np.array(self.kurt, ndmin=2)
                 returns = np.array(self.returns, ndmin=2)
         elif model == "BL":
             mu = np.array(self.mu_bl, ndmin=2)
@@ -1215,41 +2114,104 @@ class Portfolio(object):
                 sigma = np.array(self.cov_bl, ndmin=2)
             elif hist == True:
                 sigma = np.array(self.cov, ndmin=2)
+            if self.kurt is not None:
+                kurt = np.array(self.kurt, ndmin=2)
             returns = np.array(self.returns, ndmin=2)
         elif model == "BL_FM":
             mu = np.array(self.mu_bl_fm, ndmin=2)
             if hist == False:
                 sigma = np.array(self.cov_bl_fm, ndmin=2)
+                if self.kurt_fm is not None:
+                    kurt = np.array(self.kurt_fm, ndmin=2)
                 returns = np.array(self.returns_fm, ndmin=2)
             elif hist == True:
                 sigma = np.array(self.cov, ndmin=2)
+                if self.kurt is not None:
+                    kurt = np.array(self.kurt, ndmin=2)
                 returns = np.array(self.returns, ndmin=2)
             elif hist == 2:
                 sigma = np.array(self.cov_fm, ndmin=2)
+                if self.kurt_fm is not None:
+                    kurt = np.array(self.kurt_fm, ndmin=2)
                 returns = np.array(self.returns_fm, ndmin=2)
+        elif model == "EP":
+            mu = np.array(self.mu_ep, ndmin=2)
+            if hist == False:
+                sigma = np.array(self.cov_ep, ndmin=2)
+                if self.kurt_ep is not None:
+                    kurt = np.array(self.kurt_ep, ndmin=2)
+            elif hist == True:
+                sigma = np.array(self.cov, ndmin=2)
+                if self.kurt is not None:
+                    kurt = np.array(self.kurt, ndmin=2)
+            returns = np.array(self.returns, ndmin=2)
 
         # General Model Variables
 
         returns = np.array(returns, ndmin=2)
-        w = cp.Variable((mu.shape[1], 1))
+        T, N = returns.shape
+        onesvec = np.ones((T, 1))
+        w = cp.Variable((N, 1))
         k = cp.Variable((1, 1))
         rf0 = rf
-        T, N = returns.shape
         gr = cp.Variable((T, 1))
+
+        constraints = []
+
+        # SDP Model Variables
+
+        sdpmodel = False
+        if rm in ["KT", "SKT"]:
+            sdpmodel = True
+        elif (
+            kurt is not None
+            or self.skurt is not None
+            or self.network_sdp is not None
+            or self.cluster_sdp is not None
+            or (self.arcinequality is not None and self.brcinequality is not None)
+        ):
+            sdpmodel = True
+        elif self.upperkt is not None or self.upperskt is not None:
+            sdpmodel = True
+
+        if sdpmodel:
+            W = cp.Variable((N, N), symmetric=True)
+            M1 = cp.vstack([W, w.T])
+            if obj == "Sharpe":
+                M2 = cp.vstack([w, k])
+            else:
+                M2 = cp.vstack([w, np.ones((1, 1))])
+            M3 = cp.hstack([M1, M2])
+            sdpconstraints = [M3 >> 0]
 
         # MV Model Variables
 
-        g = cp.Variable(nonneg=True)
-        G = sqrtm(sigma)
-        risk1 = g**2
-        devconstraints = [cp.SOC(g, G.T @ w)]
+        penalty_factor = cp.Constant(0)
+        if (
+            self.network_sdp is None
+            and self.cluster_sdp is None
+            and (self.arcinequality is None and self.brcinequality is None)
+        ):
+            g = cp.Variable(nonneg=True)
+            G = sqrtm(sigma)
+            risk1 = g**2
+            devconstraints = [cp.SOC(g, G.T @ w)]
+        elif (
+            self.network_sdp is not None
+            or self.cluster_sdp is not None
+            or (self.arcinequality is not None and self.brcinequality is not None)
+        ):
+            risk1 = cp.trace(sigma @ W)
+            devconstraints = []
+            if rm != "MV" and self.upperdev is None:
+                penalty_factor = self.graph_penalty * cp.trace(W)
 
         # Return Variables
 
         if model == "Classic":
             if kelly == "exact":
                 if obj == "Sharpe":
-                    ret = 1 / T * cp.sum(gr) - rf0 * k
+                    ret = 1 / T * cp.sum(gr)
                 else:
                     ret = 1 / T * cp.sum(cp.log(1 + returns @ w))
             elif kelly == "approx":
@@ -1257,7 +2219,7 @@ class Portfolio(object):
                     ret = mu @ w - 0.5 * cp.quad_over_lin(g, k)
                 else:
                     ret = mu @ w - 0.5 * g**2
-            elif kelly == False:
+            elif kelly is None:
                 ret = mu @ w
         else:
             ret = mu @ w
@@ -1266,11 +2228,9 @@ class Portfolio(object):
 
         madmodel = False
         Y = cp.Variable((T, 1))
-        u = np.repeat(mu, T, axis=0)
-        a = returns - u
+        Rc = returns - np.repeat(mu, T, axis=0)
         risk2 = cp.sum(Y) / T
-        # madconstraints=[a @ w >= -Y, a @ w <= Y, Y >= 0]
-        madconstraints = [a @ w * 1000 >= -Y * 1000, Y * 1000 >= 0]
+        madconstraints = [Y * 1000 >= -Rc @ w * 1000, Y * 1000 >= 0]
 
         # Semi Variance Model Variables
 
@@ -1278,18 +2238,21 @@ class Portfolio(object):
 
         # CVaR Model Variables
 
-        VaR = cp.Variable((1, 1))
+        cvarmodel = False
+        VaR_1 = cp.Variable((1, 1))
         alpha = self.alpha
         X = returns @ w
-        Z = cp.Variable((T, 1))
-        risk4 = VaR + 1 / (alpha * T) * cp.sum(Z)
-        cvarconstraints = [Z >= 0, Z >= -X - VaR]
+        Z1 = cp.Variable((T, 1))
+        CVaR_L = VaR_1 + 1 / (alpha * T) * cp.sum(Z1)
+        risk4 = CVaR_L
+        cvarconstraints = [Z1 * 1000 >= 0, Z1 * 1000 >= -X * 1000 - VaR_1 * 1000]
 
         # Worst Realization (Minimax) Model Variables
 
-        M = cp.Variable((1, 1))
-        risk5 = M
-        wrconstraints = [-X <= M]
+        wrmodel = False
+        M_L = cp.Variable((1, 1))
+        risk5 = M_L
+        wrconstraints = [-X <= M_L]
 
         # Lower Partial Moment Variables
 
@@ -1313,7 +2276,6 @@ class Portfolio(object):
         # Drawdown Model Variables
 
         drawdown = False
-
         U = cp.Variable((T + 1, 1))
         ddconstraints = [
             U[1:] * 1000 >= U[:-1] * 1000 - X * 1000,
@@ -1334,11 +2296,11 @@ class Portfolio(object):
         # Conditional Drawdown Model Variables
 
         DaR = cp.Variable((1, 1))
-        Zd = cp.Variable((T, 1))
-        risk10 = DaR + 1 / (alpha * T) * cp.sum(Zd)
+        Zd1 = cp.Variable((T, 1))
+        risk10 = DaR + 1 / (alpha * T) * cp.sum(Zd1)
         cdarconstraints = [
-            Zd * 1000 >= U[1:] * 1000 - DaR * 1000,
-            Zd * 1000 >= 0,
+            Zd1 * 1000 >= U[1:] * 1000 - DaR * 1000,
+            Zd1 * 1000 >= 0,
         ]
 
         # Ulcer Index Model Variables
@@ -1349,21 +2311,19 @@ class Portfolio(object):
 
         t1 = cp.Variable((1, 1))
         s1 = cp.Variable((1, 1), nonneg=True)
-        ui = cp.Variable((T, 1))
-        risk12 = t1 + s1 * np.log(1 / (alpha * T))
+        u1 = cp.Variable((T, 1))
+        EVaR_L = t1 + s1 * np.log(1 / (alpha * T))
+        risk12 = EVaR_L
+        evarmodel = False
 
         if obj == "Sharpe":
-            evarconstraints = [cp.sum(ui) * 1000 <= s1 * 1000]
+            evarconstraints = [cp.sum(u1) * 1000 <= s1 * 1000]
             evarconstraints += [
-                cp.constraints.ExpCone(
-                    -X * 1000 - t1 * 1000, np.ones((T, 1)) @ s1 * 1000, ui * 1000
-                )
+                cp.ExpCone(-X * 1000 - t1 * 1000, onesvec @ s1 * 1000, u1 * 1000)
             ]
         else:
-            evarconstraints = [cp.sum(ui) <= s1]
-            evarconstraints += [
-                cp.constraints.ExpCone(-X - t1, np.ones((T, 1)) @ s1, ui)
-            ]
+            evarconstraints = [cp.sum(u1) <= s1]
+            evarconstraints += [cp.ExpCone(-X - t1, onesvec @ s1, u1)]
 
         # Entropic Drawdown at Risk Model Variables
 
@@ -1375,158 +2335,545 @@ class Portfolio(object):
         if obj == "Sharpe":
             edarconstraints = [cp.sum(uj) * 1000 <= s2 * 1000]
             edarconstraints += [
-                cp.constraints.ExpCone(
+                cp.ExpCone(
                     U[1:] * 1000 - t2 * 1000,
-                    np.ones((T, 1)) @ s2 * 1000,
+                    onesvec @ s2 * 1000,
                     uj * 1000,
                 )
             ]
         else:
             edarconstraints = [cp.sum(uj) <= s2]
-            edarconstraints += [
-                cp.constraints.ExpCone(U[1:] - t2, np.ones((T, 1)) @ s2, uj)
-            ]
+            edarconstraints += [cp.ExpCone(U[1:] - t2, onesvec @ s2, uj)]
 
         # Gini Mean Difference Model Variables
 
-        owamodel = False
-        a1 = cp.Variable((T, 1))
-        b1 = cp.Variable((T, 1))
-        y = cp.Variable((T, 1))
-        risk14 = cp.sum(a1 + b1)
+        p_1, p_2, p_3, p_4, p_5 = self.p_1, self.p_2, self.p_3, self.p_4, self.p_5
 
-        owaconstraints = [returns @ w == y]
-        gmd_w = owa.owa_gmd(T) / 2
-        onesvec = np.ones((T, 1))
-        gmdconstraints = [y @ gmd_w.T <= onesvec @ a1.T + b1 @ onesvec.T]
+        t5 = cp.Variable((1, 1))
+        nu5 = cp.Variable((T, 1), nonneg=True)
+        eta5 = cp.Variable((T, 1), nonneg=True)
+
+        epsilon51 = cp.Variable((T, 1))
+        psi51 = cp.Variable((T, 1))
+        Z51 = cp.Variable((1, 1))
+        Y51 = cp.Variable((1, 1), nonneg=True)
+
+        epsilon52 = cp.Variable((T, 1))
+        psi52 = cp.Variable((T, 1))
+        Z52 = cp.Variable((1, 1))
+        Y52 = cp.Variable((1, 1), nonneg=True)
+
+        epsilon53 = cp.Variable((T, 1))
+        psi53 = cp.Variable((T, 1))
+        Z53 = cp.Variable((1, 1))
+        Y53 = cp.Variable((1, 1), nonneg=True)
+
+        epsilon54 = cp.Variable((T, 1))
+        psi54 = cp.Variable((T, 1))
+        Z54 = cp.Variable((1, 1))
+        Y54 = cp.Variable((1, 1), nonneg=True)
+
+        epsilon55 = cp.Variable((T, 1))
+        psi55 = cp.Variable((T, 1))
+        Z55 = cp.Variable((1, 1))
+        Y55 = cp.Variable((1, 1), nonneg=True)
+
+        gmd_w = -owa.owa_gmd(T)
+
+        c51 = gmd_w.sum()
+        c52 = gmd_w.min()
+        c53 = gmd_w.max()
+        d51 = norm(gmd_w.flatten(), ord=p_1)
+        d52 = norm(gmd_w.flatten(), ord=p_2)
+        d53 = norm(gmd_w.flatten(), ord=p_3)
+        d54 = norm(gmd_w.flatten(), ord=p_4)
+        d55 = norm(gmd_w.flatten(), ord=p_5)
+
+        risk14 = (
+            c51 * t5
+            - c52 * cp.sum(nu5)
+            + d51 * Y51
+            + d52 * Y52
+            + d53 * Y53
+            + d54 * Y54
+            + d55 * Y55
+            + c53 * cp.sum(eta5)
+        )
+
+        gmdconstraints = [
+            X
+            + t5
+            - nu5
+            + eta5
+            - epsilon51
+            - epsilon52
+            - epsilon53
+            - epsilon54
+            - epsilon55
+            == 0,
+            Z51 + Y51 == cp.sum(psi51),
+            Z52 + Y52 == cp.sum(psi52),
+            Z53 + Y53 == cp.sum(psi53),
+            Z54 + Y54 == cp.sum(psi54),
+            Z55 + Y55 == cp.sum(psi55),
+            cp.PowCone3D(
+                -Z51 * p_1 * onesvec, psi51 * p_1 / (p_1 - 1), epsilon51, 1 / p_1
+            ),
+            cp.PowCone3D(
+                -Z52 * p_2 * onesvec, psi52 * p_2 / (p_2 - 1), epsilon52, 1 / p_2
+            ),
+            cp.PowCone3D(
+                -Z53 * p_3 * onesvec, psi53 * p_3 / (p_3 - 1), epsilon53, 1 / p_3
+            ),
+            cp.PowCone3D(
+                -Z54 * p_4 * onesvec, psi54 * p_4 / (p_4 - 1), epsilon54, 1 / p_4
+            ),
+            cp.PowCone3D(
+                -Z55 * p_5 * onesvec, psi55 * p_5 / (p_5 - 1), epsilon55, 1 / p_5
+            ),
+        ]
 
         # Tail Gini Model Variables
 
-        a2 = cp.Variable((T, 1))
-        b2 = cp.Variable((T, 1))
-        risk15 = cp.sum(a2 + b2)
-        a_sim = self.a_sim
+        tgmodel = False
+        t6 = cp.Variable((1, 1))
+        nu6 = cp.Variable((T, 1), nonneg=True)
+        eta6 = cp.Variable((T, 1), nonneg=True)
 
-        tg_w = owa.owa_tg(T, alpha=alpha)
-        tgconstraints = [y @ tg_w.T <= onesvec @ a2.T + b2 @ onesvec.T]
+        epsilon61 = cp.Variable((T, 1))
+        psi61 = cp.Variable((T, 1))
+        Z61 = cp.Variable((1, 1))
+        Y61 = cp.Variable((1, 1), nonneg=True)
+
+        epsilon62 = cp.Variable((T, 1))
+        psi62 = cp.Variable((T, 1))
+        Z62 = cp.Variable((1, 1))
+        Y62 = cp.Variable((1, 1), nonneg=True)
+
+        epsilon63 = cp.Variable((T, 1))
+        psi63 = cp.Variable((T, 1))
+        Z63 = cp.Variable((1, 1))
+        Y63 = cp.Variable((1, 1), nonneg=True)
+
+        epsilon64 = cp.Variable((T, 1))
+        psi64 = cp.Variable((T, 1))
+        Z64 = cp.Variable((1, 1))
+        Y64 = cp.Variable((1, 1), nonneg=True)
+
+        epsilon65 = cp.Variable((T, 1))
+        psi65 = cp.Variable((T, 1))
+        Z65 = cp.Variable((1, 1))
+        Y65 = cp.Variable((1, 1), nonneg=True)
+
+        a_sim = self.a_sim
+        tg_w = -owa.owa_tg(T, alpha=alpha, a_sim=a_sim)
+
+        c61 = tg_w.sum()
+        c62 = tg_w.min()
+        c63 = tg_w.max()
+        d61 = norm(tg_w.flatten(), ord=p_1)
+        d62 = norm(tg_w.flatten(), ord=p_2)
+        d63 = norm(tg_w.flatten(), ord=p_3)
+        d64 = norm(tg_w.flatten(), ord=p_4)
+        d65 = norm(tg_w.flatten(), ord=p_5)
+
+        TG_L = (
+            c61 * t6
+            - c62 * cp.sum(nu6)
+            + d61 * Y61
+            + d62 * Y62
+            + d63 * Y63
+            + d64 * Y64
+            + d65 * Y65
+            + c63 * cp.sum(eta6)
+        )
+        risk15 = TG_L
+
+        tgconstraints = [
+            X * 100
+            + t6 * 100
+            - nu6 * 100
+            + eta6 * 100
+            - epsilon61 * 100
+            - epsilon62 * 100
+            - epsilon63 * 100
+            - epsilon64 * 100
+            - epsilon65 * 100
+            == 0,
+            Z61 + Y61 == cp.sum(psi61),
+            Z62 + Y62 == cp.sum(psi62),
+            Z63 + Y63 == cp.sum(psi63),
+            Z64 + Y64 == cp.sum(psi64),
+            Z65 + Y65 == cp.sum(psi65),
+            cp.PowCone3D(
+                -Z61 * p_1 * onesvec, psi61 * p_1 / (p_1 - 1), epsilon61, 1 / p_1
+            ),
+            cp.PowCone3D(
+                -Z62 * p_2 * onesvec, psi62 * p_2 / (p_2 - 1), epsilon62, 1 / p_2
+            ),
+            cp.PowCone3D(
+                -Z63 * p_3 * onesvec, psi63 * p_3 / (p_3 - 1), epsilon63, 1 / p_3
+            ),
+            cp.PowCone3D(
+                -Z64 * p_4 * onesvec, psi64 * p_4 / (p_4 - 1), epsilon64, 1 / p_4
+            ),
+            cp.PowCone3D(
+                -Z65 * p_5 * onesvec, psi65 * p_5 / (p_5 - 1), epsilon65, 1 / p_5
+            ),
+        ]
 
         # Range Model Variables
 
-        a3 = cp.Variable((T, 1))
-        b3 = cp.Variable((T, 1))
-        risk16 = cp.sum(a3 + b3)
-
-        rg_w = owa.owa_rg(T)
-        rgconstraints = [y @ rg_w.T <= onesvec @ a3.T + b3 @ onesvec.T]
+        M_G = cp.Variable((1, 1))
+        risk16 = M_L - M_G
+        rgconstraints = [-X >= M_G]
 
         # CVaR Range Model Variables
 
-        a4 = cp.Variable((T, 1))
-        b4 = cp.Variable((T, 1))
-        risk17 = cp.sum(a4 + b4)
+        VaR_2 = cp.Variable((1, 1))
+        Z2 = cp.Variable((T, 1))
 
         if self.beta is None:
             beta = alpha
         else:
             beta = self.beta
 
-        cvrg_w = owa.owa_cvrg(T, alpha=alpha, beta=beta)
-        cvrgconstraints = [y @ cvrg_w.T <= onesvec @ a4.T + b4 @ onesvec.T]
+        CVaR_G = VaR_2 + 1 / (beta * T) * cp.sum(Z2)
+        risk17 = CVaR_L - CVaR_G
+        cvrgconstraints = [Z2 * 1000 <= 0, Z2 * 1000 <= -X * 1000 - VaR_2 * 1000]
 
         # Tail Gini Range Model Variables
 
-        a5 = cp.Variable((T, 1))
-        b5 = cp.Variable((T, 1))
-        risk18 = cp.sum(a5 + b5)
+        t7 = cp.Variable((1, 1))
+        nu7 = cp.Variable((T, 1), nonneg=True)
+        eta7 = cp.Variable((T, 1), nonneg=True)
+
+        epsilon71 = cp.Variable((T, 1))
+        psi71 = cp.Variable((T, 1))
+        Z71 = cp.Variable((1, 1))
+        Y71 = cp.Variable((1, 1), nonneg=True)
+
+        epsilon72 = cp.Variable((T, 1))
+        psi72 = cp.Variable((T, 1))
+        Z72 = cp.Variable((1, 1))
+        Y72 = cp.Variable((1, 1), nonneg=True)
+
+        epsilon73 = cp.Variable((T, 1))
+        psi73 = cp.Variable((T, 1))
+        Z73 = cp.Variable((1, 1))
+        Y73 = cp.Variable((1, 1), nonneg=True)
+
+        epsilon74 = cp.Variable((T, 1))
+        psi74 = cp.Variable((T, 1))
+        Z74 = cp.Variable((1, 1))
+        Y74 = cp.Variable((1, 1), nonneg=True)
+
+        epsilon75 = cp.Variable((T, 1))
+        psi75 = cp.Variable((T, 1))
+        Z75 = cp.Variable((1, 1))
+        Y75 = cp.Variable((1, 1), nonneg=True)
 
         if self.b_sim is None:
             b_sim = a_sim
         else:
             b_sim = self.b_sim
 
-        tgrg_w = owa.owa_tgrg(T, alpha=alpha, a_sim=a_sim, beta=beta, b_sim=b_sim)
-        tgrgconstraints = [y @ tgrg_w.T <= onesvec @ a5.T + b5 @ onesvec.T]
+        tgrg_w = -owa.owa_tg(T, alpha=beta, a_sim=b_sim)
+
+        c71 = tgrg_w.sum()
+        c72 = tgrg_w.min()
+        c73 = tgrg_w.max()
+        d71 = norm(tgrg_w.flatten(), ord=p_1)
+        d72 = norm(tgrg_w.flatten(), ord=p_2)
+        d73 = norm(tgrg_w.flatten(), ord=p_3)
+        d74 = norm(tgrg_w.flatten(), ord=p_4)
+        d75 = norm(tgrg_w.flatten(), ord=p_5)
+
+        TG_G = (
+            c71 * t7
+            - c72 * cp.sum(nu7)
+            + d71 * Y71
+            + d72 * Y72
+            + d73 * Y73
+            + d74 * Y74
+            + d75 * Y75
+            + c73 * cp.sum(eta7)
+        )
+        risk18 = TG_L + TG_G
+
+        tgrgconstraints = [
+            -X * 100
+            + t7 * 100
+            - nu7 * 100
+            + eta7 * 100
+            - epsilon71 * 100
+            - epsilon72 * 100
+            - epsilon73 * 100
+            - epsilon74 * 100
+            - epsilon75 * 100
+            == 0,
+            Z71 + Y71 == cp.sum(psi71),
+            Z72 + Y72 == cp.sum(psi72),
+            Z73 + Y73 == cp.sum(psi73),
+            Z74 + Y74 == cp.sum(psi74),
+            Z75 + Y75 == cp.sum(psi75),
+            cp.PowCone3D(
+                -Z71 * p_1 * onesvec, psi71 * p_1 / (p_1 - 1), epsilon71, 1 / p_1
+            ),
+            cp.PowCone3D(
+                -Z72 * p_2 * onesvec, psi72 * p_2 / (p_2 - 1), epsilon72, 1 / p_2
+            ),
+            cp.PowCone3D(
+                -Z73 * p_3 * onesvec, psi73 * p_3 / (p_3 - 1), epsilon73, 1 / p_3
+            ),
+            cp.PowCone3D(
+                -Z74 * p_4 * onesvec, psi74 * p_4 / (p_4 - 1), epsilon74, 1 / p_4
+            ),
+            cp.PowCone3D(
+                -Z75 * p_5 * onesvec, psi75 * p_5 / (p_5 - 1), epsilon75, 1 / p_5
+            ),
+        ]
 
         # Kurtosis Model Variables
-        if self.kurt is not None:
-            L_2 = self.L_2
-            S_2 = self.S_2
-            Sqrt_Sigma_4 = S_2 @ self.kurt @ S_2.T
-            Sqrt_Sigma_4 = sqrtm(Sqrt_Sigma_4)
-            g1 = cp.Variable(nonneg=True)
-            risk19 = g1
+
+        if kurt is not None:
             ktconstraints = []
 
-            if self.n_max_kurt <= N:
-                W1 = cp.Variable((N, N), PSD=True)
+            if N > self.n_max_kurt:
+                K = 2 * N
+                g2 = cp.Variable((K, 1))
+                risk19 = cp.pnorm(g2, p=2)
+                A = af.block_vec_pq(kurt, N, N)
+                s_A, V_A = cf.k_eigh(A, K)
+                s_A = np.clip(s_A, 0, np.inf)
+
+                Bi = []
+                for i in range(K):
+                    B = s_A[i] ** 0.5 * V_A[:, i]
+                    B = B.reshape((N, N), order="F").real
+                    Bi.append(B)
+
+                for i in range(K):
+                    ktconstraints += [g2[i, 0] == cp.trace(Bi[i] @ W)]
             else:
-                W1 = cp.Variable((N, N), symmetric=True)
-                ktconstraints += [W1 >= 0]
-
-            M11 = cp.vstack([W1, w.T])
-            if obj == "Sharpe":
-                M21 = cp.vstack([w, k])
-            else:
-                M21 = cp.vstack([w, np.ones((1, 1))])
-
-            M31 = cp.hstack([M11, M21])
-            z1 = L_2 @ cp.reshape(cp.vec(W1), (N * N, 1))
-            ktconstraints += [
-                M31 >> 0,
-                cp.SOC(g1, Sqrt_Sigma_4 @ z1),
-            ]
-
-            L_i = np.linalg.cholesky(sigma).T
-            if self.n_max_kurt < N:
-                v1 = cp.Variable()
-                if obj == "Sharpe":
-                    ktconstraints += [cp.SOC(1 + v1, cp.vstack([k - v1, 2 * L_i @ w]))]
-                else:
-                    ktconstraints += [
-                        cp.SOC(1 + v1, cp.vstack([np.ones((1, 1)) - v1, 2 * L_i @ w]))
-                    ]
-                ktconstraints += [cp.sum(cp.multiply(sigma.T, W1)) == v1]
+                L_2 = self.L_2
+                S_2 = self.S_2
+                Sqrt_Sigma_4 = S_2 @ kurt @ S_2.T
+                Sqrt_Sigma_4 = sqrtm(Sqrt_Sigma_4)
+                g2 = cp.Variable(nonneg=True)
+                risk19 = g2
+                z = L_2 @ cp.reshape(cp.vec(W, order="F"), (N * N, 1), order="F")
+                ktconstraints += [cp.SOC(g2, Sqrt_Sigma_4 @ z)]
 
         # Semi Kurtosis Model Variables
+
         if self.skurt is not None:
-            Sqrt_SSigma_4 = S_2 @ self.skurt @ S_2.T
-            Sqrt_SSigma_4 = sqrtm(Sqrt_SSigma_4)
-            g2 = cp.Variable(nonneg=True)
-            risk20 = g2
             sktconstraints = []
 
-            if self.n_max_kurt <= N:
-                W2 = cp.Variable((N, N), PSD=True)
-            else:
-                W2 = cp.Variable((N, N), symmetric=True)
-                sktconstraints += [W2 >= 0]
+            if N > self.n_max_kurt:
+                K = 2 * N
+                sg2 = cp.Variable((K, 1))
+                risk20 = cp.pnorm(sg2, p=2)
+                SA = af.block_vec_pq(self.skurt, N, N)
+                s_SA, V_SA = cf.k_eigh(SA, K)
+                s_SA = np.clip(s_SA, 0, np.inf)
 
-            M12 = cp.vstack([W2, w.T])
-            if obj == "Sharpe":
-                M22 = cp.vstack([w, k])
-            else:
-                M22 = cp.vstack([w, np.ones((1, 1))])
+                SBi = []
+                for i in range(K):
+                    SB = s_SA[i] ** 0.5 * V_SA[:, i]
+                    SB = SB.reshape((N, N), order="F").real
+                    SBi.append(SB)
 
-            M32 = cp.hstack([M12, M22])
-            z2 = L_2 @ cp.reshape(cp.vec(W2), (N * N, 1))
-            sktconstraints += [
-                M32 >> 0,
-                cp.SOC(g2, Sqrt_SSigma_4 @ z2),
+                for i in range(K):
+                    sktconstraints += [sg2[i, 0] == cp.trace(SBi[i] @ W)]
+
+            else:
+                L_2 = self.L_2
+                S_2 = self.S_2
+                Sqrt_SSigma_4 = S_2 @ self.skurt @ S_2.T
+                Sqrt_SSigma_4 = sqrtm(Sqrt_SSigma_4)
+                sg2 = cp.Variable(nonneg=True)
+                risk20 = sg2
+                sz = L_2 @ cp.reshape(cp.vec(W, order="F"), (N * N, 1), order="F")
+                sktconstraints += [cp.SOC(sg2, Sqrt_SSigma_4 @ sz)]
+
+        # Relativistic Value at Risk Variables
+
+        kappa = self.kappa
+        t3 = cp.Variable((1, 1))
+        s3 = cp.Variable((1, 1), nonneg=True)
+        omega3 = cp.Variable((T, 1))
+        psi3 = cp.Variable((T, 1))
+        theta3 = cp.Variable((T, 1))
+        epsilon3 = cp.Variable((T, 1))
+
+        rlvarconstraints = [
+            cp.constraints.power.PowCone3D(
+                s3 * (1 + kappa) / (2 * kappa) * onesvec,
+                psi3 * (1 + kappa) / kappa,
+                epsilon3,
+                1 / (1 + kappa),
+            ),
+            cp.constraints.power.PowCone3D(
+                omega3 / (1 - kappa),
+                theta3 / kappa,
+                -s3 / (2 * kappa) * onesvec,
+                (1 - kappa),
+            ),
+            -X * 1000 - t3 * 1000 + epsilon3 * 1000 + omega3 * 1000 <= 0,
+        ]
+
+        ln_k = ((1 / (alpha * T)) ** kappa - (1 / (alpha * T)) ** (-kappa)) / (
+            2 * kappa
+        )
+        RLVaR_L = t3 + ln_k * s3 + cp.sum(psi3 + theta3)
+        risk21 = RLVaR_L
+        rlvarmodel = False
+
+        # Relativistic Drawdown at Risk Variables
+
+        t4 = cp.Variable((1, 1))
+        s4 = cp.Variable((1, 1), nonneg=True)
+        omega4 = cp.Variable((T, 1))
+        psi4 = cp.Variable((T, 1))
+        theta4 = cp.Variable((T, 1))
+        epsilon4 = cp.Variable((T, 1))
+
+        rldarconstraints = [
+            cp.constraints.power.PowCone3D(
+                s4 * (1 + kappa) / (2 * kappa) * onesvec,
+                psi4 * (1 + kappa) / kappa,
+                epsilon4,
+                1 / (1 + kappa),
+            ),
+            cp.constraints.power.PowCone3D(
+                omega4 / (1 - kappa),
+                theta4 / kappa,
+                -s4 / (2 * kappa) * onesvec,
+                (1 - kappa),
+            ),
+            U[1:] * 1000 - t4 * 1000 + epsilon4 * 1000 + omega4 * 1000 <= 0,
+        ]
+
+        risk22 = t4 + ln_k * s4 + cp.sum(psi4 + theta4)
+
+        # Entropic Value at Risk Range Model Variables
+
+        t8 = cp.Variable((1, 1))
+        s8 = cp.Variable((1, 1), nonpos=True)
+        u8 = cp.Variable((T, 1))
+        EVaR_G = t8 + s8 * np.log(1 / (beta * T))
+        risk23 = EVaR_L - EVaR_G
+
+        if obj == "Sharpe":
+            evrgconstraints = [cp.sum(u8) * 1000 >= s8 * 1000]
+            evrgconstraints += [
+                cp.ExpCone(X * 1000 + t8 * 1000, onesvec @ -s8 * 1000, -u8 * 1000)
+            ]
+        else:
+            evrgconstraints = [cp.sum(u8) >= s8]
+            evrgconstraints += [cp.ExpCone(X + t8, onesvec @ -s8, -u8)]
+
+        # Relativistic Value at Risk Range Variables
+
+        if self.kappa_g is None:
+            kappa_g = kappa
+        else:
+            kappa_g = self.kappa_g
+
+        t9 = cp.Variable((1, 1))
+        s9 = cp.Variable((1, 1), nonpos=True)
+        omega9 = cp.Variable((T, 1))
+        psi9 = cp.Variable((T, 1))
+        theta9 = cp.Variable((T, 1))
+        epsilon9 = cp.Variable((T, 1))
+
+        rvrgconstraints = [
+            cp.constraints.power.PowCone3D(
+                -s9 * (1 + kappa_g) / (2 * kappa_g) * onesvec,
+                -psi9 * (1 + kappa_g) / kappa_g,
+                -epsilon9,
+                1 / (1 + kappa_g),
+            ),
+            cp.constraints.power.PowCone3D(
+                -omega9 / (1 - kappa_g),
+                -theta9 / kappa_g,
+                s9 / (2 * kappa_g) * onesvec,
+                (1 - kappa_g),
+            ),
+            X * 1000 + t9 * 1000 - epsilon9 * 1000 - omega9 * 1000 <= 0,
+        ]
+
+        ln_k_g = ((1 / (beta * T)) ** kappa_g - (1 / (beta * T)) ** (-kappa_g)) / (
+            2 * kappa_g
+        )
+
+        RLVaR_G = t9 + ln_k_g * s9 + cp.sum(psi9 + theta9)
+        risk24 = RLVaR_L - RLVaR_G
+
+        # Even Moment of order 2p Risk Variables
+
+        p_em = self.p_em
+        u10 = cp.Variable((T, 1))
+        theta10 = cp.Variable((T, 1))
+        g10 = cp.Variable(nonneg=True)
+
+        emconstraints = [
+            cp.sum(u10) <= g10,
+            cp.PowCone3D(u10 * T, g10 * onesvec, theta10, 1 / p_em),
+        ]
+        if obj == "Sharpe":
+            emconstraints += [
+                cp.PowCone3D(theta10, onesvec * k, Rc @ w, 1 / 2),
+            ]
+        else:
+            emconstraints += [
+                cp.PowCone3D(theta10, onesvec, Rc @ w, 1 / 2),
             ]
 
-            if self.n_max_kurt < N:
-                v2 = cp.Variable()
-                if obj == "Sharpe":
-                    sktconstraints += [cp.SOC(1 + v2, cp.vstack([k - v2, 2 * L_i @ w]))]
-                else:
-                    sktconstraints += [
-                        cp.SOC(1 + v2, cp.vstack([np.ones((1, 1)) - v2, 2 * L_i @ w]))
-                    ]
-                sktconstraints += [cp.sum(cp.multiply(sigma.T, W2)) == v2]
+        risk25 = g10
 
-        # Cardinal Boolean Variables
+        # Even Semi Moment of order 2p Risk Variables
 
-        if self.card is not None:
+        p_esm = self.p_esm
+        y = cp.Variable((T, 1), nonneg=True)
+        u11 = cp.Variable((T, 1))
+        theta11 = cp.Variable((T, 1))
+        g11 = cp.Variable(nonneg=True)
+
+        esmconstraints = [
+            cp.sum(u11) <= g11,
+            cp.PowCone3D(u11 * T, g11 * onesvec, theta11, 1 / p_esm),
+            y >= -Rc @ w,
+        ]
+        if obj == "Sharpe":
+            esmconstraints += [
+                cp.PowCone3D(theta11, onesvec * k, y, 1 / 2),
+            ]
+        else:
+            esmconstraints += [
+                cp.PowCone3D(theta11, onesvec, y, 1 / 2),
+            ]
+
+        risk26 = g11
+
+        # Boolean Variables
+
+        flag_int = False
+        if (
+            self.card is not None
+            or self.network_ip is not None
+            or self.cluster_ip is not None
+            or (
+                self.aintinequality is not None
+                and self.bintinequality is not None
+                and self.cintinequality is not None
+                and self.dintinequality is not None
+                and self.eintinequality is not None
+                and self.fintinequality is not None
+            )
+        ):
+            flag_int = True
             if obj == "Sharpe":
                 e = cp.Variable((mu.shape[1], 1), boolean=True)
                 e1 = cp.Variable((mu.shape[1], 1))
@@ -1536,55 +2883,138 @@ class Portfolio(object):
         # Problem Weight Constraints
 
         if obj == "Sharpe":
-            constraints = [cp.sum(w) == self.budget * k, k * 1000 >= 0]
+            constraints += [cp.sum(w) == self.budget * k, k * 1000 >= 0]
             if self.sht == False:
-                constraints += [w <= self.upperlng * k, w * 1000 >= 0]
-                if self.card is not None:
+                constraints += [w * 1000 >= 0]
+                if flag_int:
                     constraints += [
-                        cp.sum(e) <= self.card,
                         e1 <= k,
                         e1 >= 0,
                         e1 <= 100000 * e,
                         e1 >= k - 100000 * (1 - e),
                         w <= self.upperlng * e1,
+                        w >= self.lowerlng * e1,
+                    ]
+                else:
+                    constraints += [
+                        w <= self.upperlng * k,
+                        w >= self.lowerlng * k,
                     ]
             elif self.sht == True:
                 constraints += [
-                    cp.sum(cp.pos(w)) * 1000 <= self.upperlng * k * 1000,
-                    cp.sum(cp.neg(w)) * 1000 <= self.uppersht * k * 1000,
+                    cp.sum(cp.pos(w)) * 1000
+                    <= (self.budget + self.budgetsht) * k * 1000,
+                    cp.sum(cp.neg(w)) * 1000 <= self.budgetsht * k * 1000,
                 ]
-                if self.card is not None:
+                if flag_int:
                     constraints += [
-                        cp.sum(e) <= self.card,
                         e1 <= k,
                         e1 >= 0,
                         e1 <= 100000 * e,
                         e1 >= k - 100000 * (1 - e),
-                        w >= -self.uppersht * e1,
-                        w <= self.upperlng * e1,
+                        w >= -min(self.uppersht, self.budgetsht) * e1,
+                        w <= min(self.upperlng, (self.budget + self.budgetsht)) * e1,
                     ]
-
+                else:
+                    constraints += [
+                        w >= -min(self.uppersht, self.budgetsht) * k,
+                        w <= min(self.upperlng, (self.budget + self.budgetsht)) * k,
+                    ]
         else:
-            constraints = [cp.sum(w) == self.budget]
+            constraints += [cp.sum(w) == self.budget]
             if self.sht == False:
-                constraints += [w <= self.upperlng, w * 1000 >= 0]
-                if self.card is not None:
+                constraints += [w * 1000 >= 0]
+                if flag_int:
                     constraints += [
-                        cp.sum(e) <= self.card,
                         w <= self.upperlng * e,
+                        w >= self.lowerlng * e,
                     ]
-
+                else:
+                    constraints += [
+                        w <= self.upperlng,
+                        w >= self.lowerlng,
+                    ]
             elif self.sht == True:
                 constraints += [
-                    cp.sum(cp.pos(w)) * 1000 <= self.upperlng * 1000,
-                    cp.sum(cp.neg(w)) * 1000 <= self.uppersht * 1000,
+                    cp.sum(cp.pos(w)) * 1000 <= (self.budget + self.budgetsht) * 1000,
+                    cp.sum(cp.neg(w)) * 1000 <= self.budgetsht * 1000,
                 ]
-                if self.card is not None:
+                if flag_int:
                     constraints += [
-                        cp.sum(e) <= self.card,
-                        w >= -self.uppersht * e,
-                        w <= self.upperlng * e,
+                        w >= -min(self.uppersht, self.budgetsht) * e,
+                        w <= min(self.upperlng, (self.budget + self.budgetsht)) * e,
                     ]
+                else:
+                    constraints += [
+                        w >= -min(self.uppersht, self.budgetsht),
+                        w <= min(self.upperlng, (self.budget + self.budgetsht)),
+                    ]
+
+        # Problem network constraints
+
+        if flag_int:
+
+            # Cardinality Constraint
+
+            if self.card is not None:
+                constraints += [
+                    cp.sum(e) <= self.card,
+                ]
+
+            # Integer Constraint
+
+            if (
+                self.aintinequality is not None
+                and self.bintinequality is not None
+                and self.cintinequality is not None
+                and self.dintinequality is not None
+                and self.eintinequality is not None
+                and self.fintinequality is not None
+            ):
+                e_set = {}
+                for key in self.aintinequality.keys():
+                    if min(self.aintinequality[key].shape) > 0:
+                        constraints += [
+                            self.aintinequality[key] @ e <= self.bintinequality[key]
+                        ]
+                    if min(self.cintinequality[key].shape) > 0:
+                        e_set[key] = cp.Variable(
+                            (int(self.cintinequality[key].shape[0] / 2), 1),
+                            boolean=True,
+                        )
+                        constraints += [
+                            self.cintinequality[key] @ e
+                            <= cp.multiply(
+                                self.dintinequality[key],
+                                cp.vstack([e_set[key], e_set[key]]),
+                            ),
+                            self.eintinequality[key] @ e_set[key]
+                            <= self.fintinequality[key],
+                        ]
+
+            # Network IP Constraint
+
+            if self.network_ip is not None:
+                constraints += [
+                    np.unique(self.network_ip + np.identity(N), axis=0) @ e <= 1
+                ]
+            # Cluster IP Constraint
+
+            if self.cluster_ip is not None:
+                constraints += [
+                    np.unique(self.cluster_ip + np.identity(N), axis=0) @ e <= 1
+                ]
+        else:
+
+            # Network SDP Constraint
+
+            if self.network_sdp is not None:
+                constraints += [cp.multiply(self.network_sdp, W) == 0]
+
+            # Cluster SDP Constraint
+
+            if self.cluster_sdp is not None:
+                constraints += [cp.multiply(self.cluster_sdp, W) == 0]
 
         # Problem Linear Constraints
 
@@ -1592,9 +3022,19 @@ class Portfolio(object):
             A = np.array(self.ainequality, ndmin=2) * 1000
             B = np.array(self.binequality, ndmin=2) * 1000
             if obj == "Sharpe":
-                constraints += [A @ w - B @ k >= 0]
+                constraints += [A @ w - B @ k <= 0]
             else:
-                constraints += [A @ w - B >= 0]
+                constraints += [A @ w - B <= 0]
+
+        # Problem Linear Risk Contribution Constraints
+
+        if self.arcinequality is not None and self.brcinequality is not None:
+            A_rc = np.array(self.arcinequality, ndmin=2) * 1000
+            B_rc = np.array(self.brcinequality, ndmin=2) * 1000
+            constraints += [
+                A_rc @ cp.reshape(cp.diag(sigma @ W), (N, 1), order="F") - B_rc * risk1
+                <= 0
+            ]
 
         # Number of Effective Assets Constraints
 
@@ -1642,14 +3082,29 @@ class Portfolio(object):
             else:
                 constraints += [ret >= self.lowerret]
 
+        # Problem centrality measures constraints
+
+        if self.acentrality is not None and self.bcentrality is not None:
+            if obj == "Sharpe":
+                constraints += [self.acentrality @ w == self.bcentrality * k]
+            else:
+                constraints += [self.acentrality @ w == self.bcentrality]
+
         # Problem risk Constraints
 
         if self.upperdev is not None:
-            if obj == "Sharpe":
-                constraints += [g <= self.upperdev * k]
+            if self.network_sdp is None and self.cluster_sdp is None:
+                if obj == "Sharpe":
+                    constraints += [g <= self.upperdev * k]
+                else:
+                    constraints += [g <= self.upperdev]
+                constraints += devconstraints
             else:
-                constraints += [g <= self.upperdev]
-            constraints += devconstraints
+                if obj == "Sharpe":
+                    constraints += [risk1 <= self.upperdev**2 * k]
+                else:
+                    constraints += [risk1 <= self.upperdev**2]
+                constraints += devconstraints
 
         if self.uppermad is not None:
             if obj == "Sharpe":
@@ -1677,7 +3132,7 @@ class Portfolio(object):
                 constraints += [-X <= self.upperwr * k]
             else:
                 constraints += [-X <= self.upperwr]
-            constraints += wrconstraints
+            wrmodel = True
 
         if self.upperflpm is not None:
             if obj == "Sharpe":
@@ -1729,6 +3184,7 @@ class Portfolio(object):
             else:
                 constraints += [risk12 <= self.upperEVaR]
             constraints += evarconstraints
+            evarmodel = True
 
         if self.upperEDaR is not None:
             if obj == "Sharpe":
@@ -1739,11 +3195,10 @@ class Portfolio(object):
 
         if self.uppergmd is not None:
             if obj == "Sharpe":
-                constraints += [risk14 <= self.uppergmd * k / 2]
+                constraints += [risk14 <= self.uppergmd * k]
             else:
-                constraints += [risk14 <= self.uppergmd / 2]
+                constraints += [risk14 <= self.uppergmd]
             constraints += gmdconstraints
-            owamodel = True
 
         if self.uppertg is not None:
             if obj == "Sharpe":
@@ -1751,7 +3206,6 @@ class Portfolio(object):
             else:
                 constraints += [risk15 <= self.uppertg]
             constraints += tgconstraints
-            owamodel = True
 
         if self.upperrg is not None:
             if obj == "Sharpe":
@@ -1759,7 +3213,7 @@ class Portfolio(object):
             else:
                 constraints += [risk16 <= self.upperrg]
             constraints += rgconstraints
-            owamodel = True
+            wrmodel = True
 
         if self.uppercvrg is not None:
             if obj == "Sharpe":
@@ -1767,7 +3221,7 @@ class Portfolio(object):
             else:
                 constraints += [risk17 <= self.uppercvrg]
             constraints += cvrgconstraints
-            owamodel = True
+            cvarmodel = True
 
         if self.uppertgrg is not None:
             if obj == "Sharpe":
@@ -1775,9 +3229,9 @@ class Portfolio(object):
             else:
                 constraints += [risk18 <= self.uppertgrg]
             constraints += tgrgconstraints
-            owamodel = True
+            tgmodel = True
 
-        if self.kurt is not None:
+        if kurt is not None:
             if self.upperkt is not None:
                 if obj == "Sharpe":
                     constraints += [risk19 <= self.upperkt * k]
@@ -1792,6 +3246,50 @@ class Portfolio(object):
                 else:
                     constraints += [risk20 <= self.upperskt]
                 constraints += sktconstraints
+
+        if self.upperRLVaR is not None:
+            if obj == "Sharpe":
+                constraints += [risk21 <= self.upperRLVaR * k]
+            else:
+                constraints += [risk21 <= self.upperRLVaR]
+            constraints += rlvarconstraints
+
+        if self.upperRLDaR is not None:
+            if obj == "Sharpe":
+                constraints += [risk22 <= self.upperRLDaR * k]
+            else:
+                constraints += [risk22 <= self.upperRLDaR]
+            constraints += rldarconstraints
+
+        if self.upperevrg is not None:
+            if obj == "Sharpe":
+                constraints += [risk23 <= self.upperevrg * k]
+            else:
+                constraints += [risk23 <= self.upperevrg]
+            constraints += evrgconstraints
+            evarmodel = True
+
+        if self.upperrvrg is not None:
+            if obj == "Sharpe":
+                constraints += [risk24 <= self.upperrvrg * k]
+            else:
+                constraints += [risk24 <= self.upperrvrg]
+            constraints += rvrgconstraints
+            rlvarmodel = True
+
+        if self.upperem is not None:
+            if obj == "Sharpe":
+                constraints += [risk25 <= self.upperem * k]
+            else:
+                constraints += [risk25 <= self.upperem]
+            constraints += emconstraints
+
+        if self.upperesm is not None:
+            if obj == "Sharpe":
+                constraints += [risk26 <= self.upperesm * k]
+            else:
+                constraints += [risk26 <= self.upperesm]
+            constraints += esmconstraints
 
         # Defining risk function
 
@@ -1838,8 +3336,7 @@ class Portfolio(object):
             l = l / 1000
         elif rm == "EVaR":
             risk = risk12
-            if self.upperEVaR is None:
-                constraints += evarconstraints
+            evarmodel = True
         elif rm == "EDaR":
             risk = risk13
             drawdown = True
@@ -1847,31 +3344,29 @@ class Portfolio(object):
                 constraints += edarconstraints
         elif rm == "GMD":
             risk = risk14
-            owamodel = True
             if self.uppergmd is None:
                 constraints += gmdconstraints
         elif rm == "TG":
             risk = risk15
-            owamodel = True
             if self.uppertg is None:
                 constraints += tgconstraints
         elif rm == "RG":
             risk = risk16
-            owamodel = True
+            wrmodel = True
             if self.upperrg is None:
                 constraints += rgconstraints
         elif rm == "CVRG":
             risk = risk17
-            owamodel = True
-            if self.uppertgrg is None:
+            cvarmodel = True
+            if self.uppercvrg is None:
                 constraints += cvrgconstraints
         elif rm == "TGRG":
             risk = risk18
-            owamodel = True
-            if self.uppertg is None:
+            tgmodel = True
+            if self.uppertgrg is None:
                 constraints += tgrgconstraints
         elif rm == "KT":
-            if self.kurt is not None:
+            if kurt is not None:
                 risk = risk19
                 if self.upperkt is None:
                     constraints += ktconstraints
@@ -1888,15 +3383,51 @@ class Portfolio(object):
                 raise ValueError(
                     "First you need to calculate Semi Cokurtosis Square Matrix."
                 )
+        elif rm == "RLVaR":
+            risk = risk21
+            rlvarmodel = True
+        elif rm == "RLDaR":
+            risk = risk22
+            drawdown = True
+            if self.upperRLDaR is None:
+                constraints += rldarconstraints
+        elif rm == "EVRG":
+            risk = risk23
+            evarmodel = True
+            if self.upperevrg is None:
+                constraints += evrgconstraints
+        elif rm == "RVRG":
+            risk = risk24
+            rlvarmodel = True
+            if self.upperrvrg is None:
+                constraints += rvrgconstraints
+        elif rm == "EM":
+            risk = risk25
+            if self.upperem is None:
+                constraints += emconstraints
+        elif rm == "ESM":
+            risk = risk26
+            if self.upperesm is None:
+                constraints += esmconstraints
 
         if madmodel == True:
             constraints += madconstraints
         if lpmmodel == True:
             constraints += lpmconstraints
+        if cvarmodel == True:
+            constraints += cvarconstraints
+        if tgmodel == True:
+            constraints += tgconstraints
+        if wrmodel == True:
+            constraints += wrconstraints
         if drawdown == True:
             constraints += ddconstraints
-        if owamodel == True:
-            constraints += owaconstraints
+        if sdpmodel == True:
+            constraints += sdpconstraints
+        if evarmodel == True:
+            constraints += evarconstraints
+        if rlvarmodel == True:
+            constraints += rlvarconstraints
 
         # Frontier Variables
 
@@ -1912,27 +3443,37 @@ class Portfolio(object):
             if model == "Classic":
                 if kelly == "exact":
                     constraints += [risk <= 1]
-                    constraints += [
-                        cp.constraints.ExpCone(gr, np.ones((T, 1)) @ k, k + returns @ w)
-                    ]
-                    objective = cp.Maximize(ret * 1000)
+                    constraints += [cp.ExpCone(gr, onesvec @ k, k + returns @ w)]
+                    objective = cp.Maximize(
+                        ret * 1000 - rf0 * k * 1000 - penalty_factor * 1000
+                    )
                 elif kelly == "approx":
                     constraints += [risk <= 1]
                     if rm != "MV":
                         constraints += devconstraints
-                    objective = cp.Maximize(ret)
-                elif kelly == False:
-                    constraints += [mu @ w - rf0 * k == 1]
-                    objective = cp.Minimize(risk * 1000)
+                    objective = cp.Maximize(ret - rf0 * k - penalty_factor)
+                elif kelly is None:
+                    if (mu < 0).all():
+                        constraints += [risk <= 1]
+                        objective = cp.Maximize(ret - rf0 * k - penalty_factor)
+                    else:
+                        constraints += [ret - rf0 * k == 1]
+                        objective = cp.Minimize(risk * 1000 + penalty_factor * 1000)
             else:
-                constraints += [mu @ w - rf0 * k == 1]
-                objective = cp.Minimize(risk * 1000)
+                if (mu < 0).all():
+                    constraints += [risk <= 1]
+                    objective = cp.Maximize(
+                        ret * 1000 - rf0 * k * 1000 - penalty_factor * 1000
+                    )
+                else:
+                    constraints += [ret - rf0 * k == 1]
+                    objective = cp.Minimize(risk * 1000 + penalty_factor * 1000)
         elif obj == "MinRisk":
-            objective = cp.Minimize(risk * 1000)
+            objective = cp.Minimize(risk * 1000 + penalty_factor * 1000)
         elif obj == "Utility":
-            objective = cp.Maximize(ret - l * risk)
+            objective = cp.Maximize(ret - l * risk - penalty_factor)
         elif obj == "MaxRet":
-            objective = cp.Maximize(ret * 1000)
+            objective = cp.Maximize(ret * 1000 - penalty_factor * 1000)
 
         try:
             prob = cp.Problem(objective, constraints)
@@ -1953,12 +3494,20 @@ class Portfolio(object):
                     self.z_EVaR = s1.value / k.value
                 if rm == "EDaR" or self.upperEDaR is not None:
                     self.z_EDaR = s2.value / k.value
+                if rm == "RLVaR" or self.upperRLVaR is not None:
+                    self.z_RLVaR = s3.value / k.value
+                if rm == "RLDaR" or self.upperRLDaR is not None:
+                    self.z_RLDaR = s4.value / k.value
             else:
                 weights = np.array(w.value, ndmin=2).T
                 if rm == "EVaR" or self.upperEVaR is not None:
                     self.z_EVaR = s1.value
                 if rm == "EDaR" or self.upperEDaR is not None:
                     self.z_EDaR = s2.value
+                if rm == "RLVaR" or self.upperRLVaR is not None:
+                    self.z_RLVaR = s3.value
+                if rm == "RLDaR" or self.upperRLDaR is not None:
+                    self.z_RLDaR = s4.value
 
             if self.sht == False:
                 weights = np.abs(weights) / np.sum(np.abs(weights)) * self.budget
@@ -1979,83 +3528,96 @@ class Portfolio(object):
 
         return self.optimal
 
-    def rp_optimization(self, model="Classic", rm="MV", rf=0, b=None, hist=True):
+    def rp_optimization(
+        self, model="Classic", rm="MV", rf=0, b=None, b_f=None, hist=True
+    ):
         r"""
         This method that calculates the risk parity portfolio using the risk
-        budgeting approach :cite:`a-Roncalli` :cite:`a-RichardRoncalli`,
+        budgeting approach :cite:`a-Roncalli` :cite:`a-RichardRoncalli` and
+        the risk parity with risk factors approach :cite:`a-Roncalli2012b`
         according to the optimization model selected by the user. The general
         problem that solves is:
-        
+
         .. math::
             \begin{aligned}
             &\underset{w}{\min} & & \phi(w)\\
-            &\text{s.t.} & & b \log(w) \geq c\\
+            &\text{s.t.} & & \mathbf{b}^{\prime} \log(w) \geq c\\
             & & & \mu w \geq \overline{\mu} \\
-            & & & Aw \geq B \\
+            & & & Aw \leq b \\
             & & & w \geq 0 \\
             \end{aligned}
-        
+
         Where:
-        
+
         :math:`w` are the weights of the portfolio.
-        
+
         :math:`\mu`: is the vector of expected returns.
-    
-        :math:`b` is a vector of risk constraints.
-        
-        :math:`Aw \geq B`: is a set of linear constraints.
-        
+
+        :math:`\mathbf{b}` is a vector of risk contribution targets.
+
+        :math:`Aw \leq b`: is a set of linear constraints on asset weights.
+
         :math:`\phi(w)`: is a risk measure.
-        
+
         :math:`c`: is an arbitrary constant.
-        
+
         Parameters
         ----------
         model : str can be 'Classic' or 'FM'
             The model used for optimize the portfolio.
             The default is 'Classic'. Possible values are:
 
-            - 'Classic': use estimates of expected return vector and covariance matrix that depends on historical data.
-            - 'FM': use estimates of expected return vector and covariance matrix based on a Risk Factor model specified by the user.
-            
+            - 'Classic': uses estimates of expected return vector and covariance matrix that depends on historical data.
+            - 'FM': uses estimates of expected return vector and covariance matrix based on a Risk Factor model specified by the user.
+            - 'FC': uses risk contributions based on risk factors.
+
         rm : str, optional
             The risk measure used to optimize the portfolio.
             The default is 'MV'. Possible values are:
-            
+
             - 'MV': Standard Deviation.
             - 'KT': Square Root of Kurtosis.
+            - 'EM': p_em Root of Even Moment of order 2 * p_em.
             - 'MAD': Mean Absolute Deviation.
             - 'GMD': Gini Mean Difference.
             - 'MSV': Semi Standard Deviation.
             - 'SKT': Square Root of Semi Kurtosis.
+            - 'ESM': p_esm Root of Even Semi Moment of order 2 * p_esm.
             - 'FLPM': First Lower Partial Moment (Omega Ratio).
             - 'SLPM': Second Lower Partial Moment (Sortino Ratio).
             - 'CVaR': Conditional Value at Risk.
             - 'TG': Tail Gini.
             - 'EVaR': Entropic Value at Risk.
+            - 'RLVaR': Relativistic Value at Risk.
             - 'CVRG': CVaR range of returns.
             - 'TGRG': Tail Gini range of returns.
+            - 'EVRG': EVaR range of returns.
+            - 'RVRG': RLVaR range of returns.
             - 'CDaR': Conditional Drawdown at Risk of uncompounded cumulative returns.
             - 'EDaR': Entropic Drawdown at Risk of uncompounded cumulative returns.
+            - 'RLDaR': Relativistic Drawdown at Risk of uncompounded cumulative returns.
             - 'UCI': Ulcer Index of uncompounded cumulative returns.
 
         rf : float, optional
             Risk free rate, must be in the same period of assets returns.
             Used for 'FLPM' and 'SLPM'.
-            The default is 0.                
+            The default is 0.
         b : float, optional
             The vector of risk constraints per asset.
             The default is 1/n (number of assets).
+        b_f : float, optional
+            The vector of risk constraints per risk factor.
+            The default is 1/n_f (number of risk factors).
         hist : bool, optional
             Indicate what kind of returns are used to calculate risk measures
-            that depends on scenarios (All except 'MV' risk measure). 
+            that depends on scenarios (All except 'MV' risk measure).
             If model = 'FM', True means historical covariance and returns and
             False means Risk Factor model for covariance and returns. The
             default is True.
-            
+
         Returns
         -------
-        w : DataFrame
+        rp_optimal : DataFrame
             The weights of optimal portfolio.
 
         """
@@ -2064,32 +3626,76 @@ class Portfolio(object):
 
         mu = None
         sigma = None
+        kurt = None
         returns = None
-        if model == "Classic":
+        if model in ["Classic", "FC"]:
             mu = np.array(self.mu, ndmin=2)
             sigma = np.array(self.cov, ndmin=2)
+            if self.kurt is not None:
+                kurt = np.array(self.kurt, ndmin=2)
             returns = np.array(self.returns, ndmin=2)
         elif model == "FM":
             mu = np.array(self.mu_fm, ndmin=2)
             if hist == False:
                 sigma = np.array(self.cov_fm, ndmin=2)
+                if self.kurt_fm is not None:
+                    kurt = np.array(self.kurt_fm, ndmin=2)
                 returns = np.array(self.returns_fm, ndmin=2)
             elif hist == True:
                 sigma = np.array(self.cov, ndmin=2)
+                if self.kurt is not None:
+                    kurt = np.array(self.kurt, ndmin=2)
                 returns = np.array(self.returns, ndmin=2)
 
         # General Model Variables
 
-        if b is None:
-            b = np.ones((1, mu.shape[1]))
-            b = b / mu.shape[1]
-
+        T, N = returns.shape
+        onesvec = np.ones((T, 1))
         returns = np.array(returns, ndmin=2)
-        w = cp.Variable((mu.shape[1], 1))
+
+        if model == "FC":
+            if self.B.shape[1] == len(self.factorslist):
+                B1 = self.B.to_numpy()
+            else:
+                B1 = self.B.to_numpy()[:, 1:]
+
+            if self.feature_selection == "PCR":
+                scaler = StandardScaler()
+                scaler.fit(self.factors)
+                X_std = scaler.transform(self.factors)
+                if self.n_components > 0 and self.n_components < 1:
+                    pca = PCA(n_components=self.n_components)
+                elif self.n_components >= 1:
+                    pca = PCA(n_components=int(self.n_components))
+                pca.fit(X_std)
+                V_p = pca.components_.T
+                std = np.array(np.std(self.factors, axis=0, ddof=1), ndmin=2)
+                B1 = (pinv(V_p) @ (B1.T * std.T)).T
+
+            B2 = pinv(B1.T)
+            N_f = B2.shape[1]
+            w1 = cp.Variable((N_f, 1))
+            w = B2 @ w1
+
+            if b_f is None:
+                rb = np.ones((N_f, 1))
+                rb = rb / N_f
+            else:
+                self.b_f = b_f.copy()
+                rb = self.b_f
+        else:
+            w = cp.Variable((N, 1))
+            if b is None:
+                rb = np.ones((N, 1))
+                rb = rb / N
+            else:
+                self.b = b.copy()
+                rb = self.b
+
         k = cp.Variable((1, 1))
         rf0 = rf
-        T, N = returns.shape
         ret = mu @ w
+
         constraints = []
 
         # MV Model Variables
@@ -2102,11 +3708,9 @@ class Portfolio(object):
         # MAD Model Variables
 
         Y = cp.Variable((T, 1))
-        u = np.repeat(mu, T, axis=0)
-        a = returns - u
+        Rc = returns - np.repeat(mu, T, axis=0)
         risk2 = cp.sum(Y) / T
-        # madconstraints=[a @ w >= -Y, a @ w <= Y, Y >= 0]
-        madconstraints = [a @ w * 1000 >= -Y * 1000, Y * 1000 >= 0]
+        madconstraints = [Y * 1000 >= -Rc @ w * 1000, Y * 1000 >= 0]
 
         # Semi Variance Model Variables
 
@@ -2114,12 +3718,13 @@ class Portfolio(object):
 
         # CVaR Model Variables
 
-        VaR = cp.Variable((1, 1))
+        VaR_1 = cp.Variable((1, 1))
         alpha = self.alpha
         X = returns @ w
-        Z = cp.Variable((T, 1))
-        risk4 = VaR + 1 / (alpha * T) * cp.sum(Z)
-        cvarconstraints = [Z * 1000 >= 0, Z * 1000 >= -X * 1000 - VaR * 1000]
+        Z1 = cp.Variable((T, 1))
+        CVaR_L = VaR_1 + 1 / (alpha * T) * cp.sum(Z1)
+        risk4 = CVaR_L
+        cvarconstraints = [Z1 * 1000 >= 0, Z1 * 1000 >= -X * 1000 - VaR_1 * 1000]
 
         # Lower Partial Moment Variables
 
@@ -2163,12 +3768,11 @@ class Portfolio(object):
         t1 = cp.Variable((1, 1))
         s1 = cp.Variable((1, 1), nonneg=True)
         ui = cp.Variable((T, 1))
-        risk12 = t1 + s1 * np.log(1 / (alpha * T))
+        EVaR_L = t1 + s1 * np.log(1 / (alpha * T))
+        risk12 = EVaR_L
         evarconstraints = [cp.sum(ui) * 1000 <= s1 * 1000]
         evarconstraints += [
-            cp.constraints.ExpCone(
-                -X * 1000 - t1 * 1000, np.ones((T, 1)) @ s1 * 1000, ui * 1000
-            )
+            cp.ExpCone(-X * 1000 - t1 * 1000, onesvec @ s1 * 1000, ui * 1000)
         ]
 
         # Entropic Drawdown at Risk Model Variables
@@ -2179,139 +3783,512 @@ class Portfolio(object):
         risk13 = t2 + s2 * np.log(1 / (alpha * T))
         edarconstraints = [cp.sum(uj) * 1000 <= s2 * 1000]
         edarconstraints += [
-            cp.constraints.ExpCone(
+            cp.ExpCone(
                 U[1:] * 1000 - t2 * 1000,
-                np.ones((T, 1)) @ s2 * 1000,
+                onesvec @ s2 * 1000,
                 uj * 1000,
             )
         ]
 
         # Gini Mean Difference Model Variables
 
-        a1 = cp.Variable((T, 1))
-        b1 = cp.Variable((T, 1))
-        y = cp.Variable((T, 1))
-        risk14 = cp.sum(a1 + b1)
+        p_1, p_2, p_3, p_4, p_5 = self.p_1, self.p_2, self.p_3, self.p_4, self.p_5
 
-        owaconstraints = [returns @ w == y]
-        gmd_w = owa.owa_gmd(T) / 2
+        t5 = cp.Variable((1, 1))
+        nu5 = cp.Variable((T, 1), nonneg=True)
+        eta5 = cp.Variable((T, 1), nonneg=True)
 
-        onesvec = np.ones((T, 1))
+        epsilon51 = cp.Variable((T, 1))
+        psi51 = cp.Variable((T, 1))
+        Z51 = cp.Variable((1, 1))
+        Y51 = cp.Variable((1, 1), nonneg=True)
+
+        epsilon52 = cp.Variable((T, 1))
+        psi52 = cp.Variable((T, 1))
+        Z52 = cp.Variable((1, 1))
+        Y52 = cp.Variable((1, 1), nonneg=True)
+
+        epsilon53 = cp.Variable((T, 1))
+        psi53 = cp.Variable((T, 1))
+        Z53 = cp.Variable((1, 1))
+        Y53 = cp.Variable((1, 1), nonneg=True)
+
+        epsilon54 = cp.Variable((T, 1))
+        psi54 = cp.Variable((T, 1))
+        Z54 = cp.Variable((1, 1))
+        Y54 = cp.Variable((1, 1), nonneg=True)
+
+        epsilon55 = cp.Variable((T, 1))
+        psi55 = cp.Variable((T, 1))
+        Z55 = cp.Variable((1, 1))
+        Y55 = cp.Variable((1, 1), nonneg=True)
+
+        gmd_w = -owa.owa_gmd(T)
+
+        c51 = gmd_w.sum()
+        c52 = gmd_w.min()
+        c53 = gmd_w.max()
+        d51 = norm(gmd_w.flatten(), ord=p_1)
+        d52 = norm(gmd_w.flatten(), ord=p_2)
+        d53 = norm(gmd_w.flatten(), ord=p_3)
+        d54 = norm(gmd_w.flatten(), ord=p_4)
+        d55 = norm(gmd_w.flatten(), ord=p_5)
+
+        risk14 = (
+            c51 * t5
+            - c52 * cp.sum(nu5)
+            + d51 * Y51
+            + d52 * Y52
+            + d53 * Y53
+            + d54 * Y54
+            + d55 * Y55
+            + c53 * cp.sum(eta5)
+        )
+
         gmdconstraints = [
-            y @ gmd_w.T * 1000 <= (onesvec @ a1.T + b1 @ onesvec.T) * 1000
+            X
+            + t5
+            - nu5
+            + eta5
+            - epsilon51
+            - epsilon52
+            - epsilon53
+            - epsilon54
+            - epsilon55
+            == 0,
+            Z51 + Y51 == cp.sum(psi51),
+            Z52 + Y52 == cp.sum(psi52),
+            Z53 + Y53 == cp.sum(psi53),
+            Z54 + Y54 == cp.sum(psi54),
+            Z55 + Y55 == cp.sum(psi55),
+            cp.PowCone3D(
+                -Z51 * p_1 * onesvec, psi51 * p_1 / (p_1 - 1), epsilon51, 1 / p_1
+            ),
+            cp.PowCone3D(
+                -Z52 * p_2 * onesvec, psi52 * p_2 / (p_2 - 1), epsilon52, 1 / p_2
+            ),
+            cp.PowCone3D(
+                -Z53 * p_3 * onesvec, psi53 * p_3 / (p_3 - 1), epsilon53, 1 / p_3
+            ),
+            cp.PowCone3D(
+                -Z54 * p_4 * onesvec, psi54 * p_4 / (p_4 - 1), epsilon54, 1 / p_4
+            ),
+            cp.PowCone3D(
+                -Z55 * p_5 * onesvec, psi55 * p_5 / (p_5 - 1), epsilon55, 1 / p_5
+            ),
         ]
 
         # Tail Gini Model Variables
 
-        a2 = cp.Variable((T, 1))
-        b2 = cp.Variable((T, 1))
-        risk15 = cp.sum(a2 + b2)
-        a_sim = self.a_sim
+        t6 = cp.Variable((1, 1))
+        nu6 = cp.Variable((T, 1), nonneg=True)
+        eta6 = cp.Variable((T, 1), nonneg=True)
 
-        tg_w = owa.owa_tg(T, alpha=alpha, a_sim=a_sim)
-        tgconstraints = [y @ tg_w.T * 1000 <= (onesvec @ a2.T + b2 @ onesvec.T) * 1000]
+        epsilon61 = cp.Variable((T, 1))
+        psi61 = cp.Variable((T, 1))
+        Z61 = cp.Variable((1, 1))
+        Y61 = cp.Variable((1, 1), nonneg=True)
+
+        epsilon62 = cp.Variable((T, 1))
+        psi62 = cp.Variable((T, 1))
+        Z62 = cp.Variable((1, 1))
+        Y62 = cp.Variable((1, 1), nonneg=True)
+
+        epsilon63 = cp.Variable((T, 1))
+        psi63 = cp.Variable((T, 1))
+        Z63 = cp.Variable((1, 1))
+        Y63 = cp.Variable((1, 1), nonneg=True)
+
+        epsilon64 = cp.Variable((T, 1))
+        psi64 = cp.Variable((T, 1))
+        Z64 = cp.Variable((1, 1))
+        Y64 = cp.Variable((1, 1), nonneg=True)
+
+        epsilon65 = cp.Variable((T, 1))
+        psi65 = cp.Variable((T, 1))
+        Z65 = cp.Variable((1, 1))
+        Y65 = cp.Variable((1, 1), nonneg=True)
+
+        a_sim = self.a_sim
+        tg_w = -owa.owa_tg(T, alpha=alpha, a_sim=a_sim)
+
+        c61 = tg_w.sum()
+        c62 = tg_w.min()
+        c63 = tg_w.max()
+        d61 = norm(tg_w.flatten(), ord=p_1)
+        d62 = norm(tg_w.flatten(), ord=p_2)
+        d63 = norm(tg_w.flatten(), ord=p_3)
+        d64 = norm(tg_w.flatten(), ord=p_4)
+        d65 = norm(tg_w.flatten(), ord=p_5)
+
+        TG_L = (
+            c61 * t6
+            - c62 * cp.sum(nu6)
+            + d61 * Y61
+            + d62 * Y62
+            + d63 * Y63
+            + d64 * Y64
+            + d65 * Y65
+            + c63 * cp.sum(eta6)
+        )
+        risk15 = TG_L
+
+        tgconstraints = [
+            X * 100
+            + t6 * 100
+            - nu6 * 100
+            + eta6 * 100
+            - epsilon61 * 100
+            - epsilon62 * 100
+            - epsilon63 * 100
+            - epsilon64 * 100
+            - epsilon65 * 100
+            == 0,
+            Z61 + Y61 == cp.sum(psi61),
+            Z62 + Y62 == cp.sum(psi62),
+            Z63 + Y63 == cp.sum(psi63),
+            Z64 + Y64 == cp.sum(psi64),
+            Z65 + Y65 == cp.sum(psi65),
+            cp.PowCone3D(
+                -Z61 * p_1 * onesvec, psi61 * p_1 / (p_1 - 1), epsilon61, 1 / p_1
+            ),
+            cp.PowCone3D(
+                -Z62 * p_2 * onesvec, psi62 * p_2 / (p_2 - 1), epsilon62, 1 / p_2
+            ),
+            cp.PowCone3D(
+                -Z63 * p_3 * onesvec, psi63 * p_3 / (p_3 - 1), epsilon63, 1 / p_3
+            ),
+            cp.PowCone3D(
+                -Z64 * p_4 * onesvec, psi64 * p_4 / (p_4 - 1), epsilon64, 1 / p_4
+            ),
+            cp.PowCone3D(
+                -Z65 * p_5 * onesvec, psi65 * p_5 / (p_5 - 1), epsilon65, 1 / p_5
+            ),
+        ]
 
         # CVaR Range Model Variables
 
-        a4 = cp.Variable((T, 1))
-        b4 = cp.Variable((T, 1))
-        risk17 = cp.sum(a4 + b4)
+        VaR_2 = cp.Variable((1, 1))
+        Z2 = cp.Variable((T, 1))
 
         if self.beta is None:
             beta = alpha
         else:
             beta = self.beta
 
-        cvrg_w = owa.owa_cvrg(T, alpha=alpha, beta=beta)
-        cvrgconstraints = [
-            y @ cvrg_w.T * 1000 <= (onesvec @ a4.T + b4 @ onesvec.T) * 1000
-        ]
+        CVaR_G = VaR_2 + 1 / (beta * T) * cp.sum(Z2)
+        risk17 = CVaR_L - CVaR_G
+        cvrgconstraints = [Z2 * 1000 <= 0, Z2 * 1000 <= -X * 1000 - VaR_2 * 1000]
 
         # Tail Gini Range Model Variables
 
-        a5 = cp.Variable((T, 1))
-        b5 = cp.Variable((T, 1))
-        risk18 = cp.sum(a5 + b5)
+        t7 = cp.Variable((1, 1))
+        nu7 = cp.Variable((T, 1), nonneg=True)
+        eta7 = cp.Variable((T, 1), nonneg=True)
+
+        epsilon71 = cp.Variable((T, 1))
+        psi71 = cp.Variable((T, 1))
+        Z71 = cp.Variable((1, 1))
+        Y71 = cp.Variable((1, 1), nonneg=True)
+
+        epsilon72 = cp.Variable((T, 1))
+        psi72 = cp.Variable((T, 1))
+        Z72 = cp.Variable((1, 1))
+        Y72 = cp.Variable((1, 1), nonneg=True)
+
+        epsilon73 = cp.Variable((T, 1))
+        psi73 = cp.Variable((T, 1))
+        Z73 = cp.Variable((1, 1))
+        Y73 = cp.Variable((1, 1), nonneg=True)
+
+        epsilon74 = cp.Variable((T, 1))
+        psi74 = cp.Variable((T, 1))
+        Z74 = cp.Variable((1, 1))
+        Y74 = cp.Variable((1, 1), nonneg=True)
+
+        epsilon75 = cp.Variable((T, 1))
+        psi75 = cp.Variable((T, 1))
+        Z75 = cp.Variable((1, 1))
+        Y75 = cp.Variable((1, 1), nonneg=True)
 
         if self.b_sim is None:
             b_sim = a_sim
         else:
             b_sim = self.b_sim
 
-        tgrg_w = owa.owa_tgrg(T, alpha=alpha, a_sim=a_sim, beta=beta, b_sim=b_sim)
+        tgrg_w = -owa.owa_tg(T, alpha=beta, a_sim=b_sim)
+
+        c71 = tgrg_w.sum()
+        c72 = tgrg_w.min()
+        c73 = tgrg_w.max()
+        d71 = norm(tgrg_w.flatten(), ord=p_1)
+        d72 = norm(tgrg_w.flatten(), ord=p_2)
+        d73 = norm(tgrg_w.flatten(), ord=p_3)
+        d74 = norm(tgrg_w.flatten(), ord=p_4)
+        d75 = norm(tgrg_w.flatten(), ord=p_5)
+
+        TG_G = (
+            c71 * t7
+            - c72 * cp.sum(nu7)
+            + d71 * Y71
+            + d72 * Y72
+            + d73 * Y73
+            + d74 * Y74
+            + d75 * Y75
+            + c73 * cp.sum(eta7)
+        )
+        risk18 = TG_L + TG_G
+
         tgrgconstraints = [
-            y @ tgrg_w.T * 1000 <= (onesvec @ a5.T + b5 @ onesvec.T) * 1000
+            -X * 100
+            + t7 * 100
+            - nu7 * 100
+            + eta7 * 100
+            - epsilon71 * 100
+            - epsilon72 * 100
+            - epsilon73 * 100
+            - epsilon74 * 100
+            - epsilon75 * 100
+            == 0,
+            Z71 + Y71 == cp.sum(psi71),
+            Z72 + Y72 == cp.sum(psi72),
+            Z73 + Y73 == cp.sum(psi73),
+            Z74 + Y74 == cp.sum(psi74),
+            Z75 + Y75 == cp.sum(psi75),
+            cp.PowCone3D(
+                -Z71 * p_1 * onesvec, psi71 * p_1 / (p_1 - 1), epsilon71, 1 / p_1
+            ),
+            cp.PowCone3D(
+                -Z72 * p_2 * onesvec, psi72 * p_2 / (p_2 - 1), epsilon72, 1 / p_2
+            ),
+            cp.PowCone3D(
+                -Z73 * p_3 * onesvec, psi73 * p_3 / (p_3 - 1), epsilon73, 1 / p_3
+            ),
+            cp.PowCone3D(
+                -Z74 * p_4 * onesvec, psi74 * p_4 / (p_4 - 1), epsilon74, 1 / p_4
+            ),
+            cp.PowCone3D(
+                -Z75 * p_5 * onesvec, psi75 * p_5 / (p_5 - 1), epsilon75, 1 / p_5
+            ),
         ]
 
         # Kurtosis Model Variables
 
-        if self.kurt is not None:
-            L_2 = self.L_2
-            S_2 = self.S_2
-            Sqrt_Sigma_4 = S_2 @ self.kurt @ S_2.T
-            Sqrt_Sigma_4 = sqrtm(Sqrt_Sigma_4)
-            g2 = cp.Variable()
-            risk19 = g2
-
-            if self.n_max_kurt <= N:
-                W = cp.Variable((N, N), PSD=True)
-            else:
-                W = cp.Variable((N, N), symmetric=True)
-                ktconstraints = [W >= 0]
-
+        if kurt is not None:
+            W = cp.Variable((N, N), symmetric=True)
             M1 = cp.vstack([W, w.T])
             M2 = cp.vstack([w, np.ones((1, 1))])
             M3 = cp.hstack([M1, M2])
-            z = L_2 @ cp.reshape(cp.vec(W), (N * N, 1))
-            ktconstraints += [
-                M3 >> 0,
-                cp.SOC(g2, Sqrt_Sigma_4 @ z),
-            ]
+            ktconstraints = [M3 >> 0]
 
-            if self.n_max_kurt > N:
-                v = cp.Variable()
-                L_i = np.linalg.cholesky(sigma).T
-                ktconstraints += [
-                    cp.SOC(1 + v, cp.vstack([np.ones((1, 1)) - v, 2 * L_i @ w])),
-                    cp.sum(cp.multiply(sigma.T, W)) == v,
-                ]
+            if N > self.n_max_kurt:
+                K = 2 * N
+                g2 = cp.Variable((K, 1))
+                risk19 = cp.pnorm(g2, p=2)
+                A = af.block_vec_pq(kurt, N, N)
+                s_A, V_A = np.linalg.eig(A)
+                s_A = np.clip(s_A, 0, np.inf)
+
+                Bi = []
+                for i in range(K):
+                    B = s_A[i] ** 0.5 * V_A[:, i]
+                    B = B.reshape((N, N), order="F").real
+                    Bi.append(B)
+
+                for i in range(K):
+                    ktconstraints += [g2[i, 0] == cp.trace(Bi[i] @ W)]
+            else:
+                L_2 = self.L_2
+                S_2 = self.S_2
+                Sqrt_Sigma_4 = S_2 @ kurt @ S_2.T
+                Sqrt_Sigma_4 = sqrtm(Sqrt_Sigma_4)
+                g2 = cp.Variable(nonneg=True)
+                risk19 = g2
+                z = L_2 @ cp.reshape(cp.vec(W, order="F"), (N * N, 1), order="F")
+                ktconstraints += [cp.SOC(g2, Sqrt_Sigma_4 @ z)]
 
         # Semi Kurtosis Model Variables
 
         if self.skurt is not None:
-            Sqrt_SSigma_4 = S_2 @ self.skurt @ S_2.T
-            Sqrt_SSigma_4 = sqrtm(Sqrt_SSigma_4)
-            sg2 = cp.Variable()
-            risk20 = sg2
-
-            if self.n_max_kurt <= N:
-                SW = cp.Variable((N, N), PSD=True)
-            else:
-                SW = cp.Variable((N, N), symmetric=True)
-                sktconstraints = [SW >= 0]
-
+            SW = cp.Variable((N, N), symmetric=True)
             SM1 = cp.vstack([SW, w.T])
             SM2 = cp.vstack([w, np.ones((1, 1))])
-            SM = cp.hstack([SM1, SM2])
-            sz = L_2 @ cp.reshape(cp.vec(SW), (N * N, 1))
-            sktconstraints += [
-                SM >> 0,
-                cp.SOC(sg2, Sqrt_SSigma_4 @ sz),
-            ]
+            SM3 = cp.hstack([SM1, SM2])
+            sktconstraints = [SM3 >> 0]
 
-            if self.n_max_kurt > N:
-                sv = cp.Variable()
-                sktconstraints += [
-                    cp.SOC(1 + sv, cp.vstack([np.ones((1, 1)) - sv, 2 * L_i @ w]))
-                ]
-                sktconstraints += [cp.sum(cp.multiply(sigma.T, SW)) == sv]
+            if N > self.n_max_kurt:
+                K = 2 * N
+                sg2 = cp.Variable((K, 1))
+                risk20 = cp.pnorm(sg2, p=2)
+                SA = af.block_vec_pq(self.skurt, N, N)
+                s_SA, V_SA = np.linalg.eig(SA)
+                s_SA = np.clip(s_SA, 0, np.inf)
+
+                SBi = []
+                for i in range(K):
+                    SB = s_SA[i] ** 0.5 * V_SA[:, i]
+                    SB = SB.reshape((N, N), order="F").real
+                    SBi.append(SB)
+
+                for i in range(K):
+                    sktconstraints += [sg2[i, 0] == cp.trace(SBi[i] @ SW)]
+
+            else:
+                L_2 = self.L_2
+                S_2 = self.S_2
+                Sqrt_SSigma_4 = S_2 @ self.skurt @ S_2.T
+                Sqrt_SSigma_4 = sqrtm(Sqrt_SSigma_4)
+                sg2 = cp.Variable(nonneg=True)
+                risk20 = sg2
+                sz = L_2 @ cp.reshape(cp.vec(SW, order="F"), (N * N, 1), order="F")
+                sktconstraints += [cp.SOC(sg2, Sqrt_SSigma_4 @ sz)]
+
+        # Relativistic Value at Risk Variables
+
+        kappa = self.kappa
+        t3 = cp.Variable((1, 1))
+        s3 = cp.Variable((1, 1), nonneg=True)
+        omega3 = cp.Variable((T, 1))
+        psi3 = cp.Variable((T, 1))
+        theta3 = cp.Variable((T, 1))
+        epsilon3 = cp.Variable((T, 1))
+
+        rlvarconstraints = [
+            cp.constraints.power.PowCone3D(
+                s3 * (1 + kappa) / (2 * kappa) * onesvec,
+                psi3 * (1 + kappa) / kappa,
+                epsilon3,
+                1 / (1 + kappa),
+            ),
+            cp.constraints.power.PowCone3D(
+                omega3 / (1 - kappa),
+                theta3 / kappa,
+                -s3 / (2 * kappa) * onesvec,
+                (1 - kappa),
+            ),
+            -X * 1000 - t3 * 1000 + epsilon3 * 1000 + omega3 * 1000 <= 0,
+        ]
+
+        ln_k = ((1 / (alpha * T)) ** kappa - (1 / (alpha * T)) ** (-kappa)) / (
+            2 * kappa
+        )
+        RLVaR_L = t3 + ln_k * s3 + onesvec.T @ psi3 + onesvec.T @ theta3
+        risk21 = RLVaR_L
+
+        # Relativistic Drawdown at Risk Variables
+
+        t4 = cp.Variable((1, 1))
+        s4 = cp.Variable((1, 1), nonneg=True)
+        omega4 = cp.Variable((T, 1))
+        psi4 = cp.Variable((T, 1))
+        theta4 = cp.Variable((T, 1))
+        epsilon4 = cp.Variable((T, 1))
+
+        rldarconstraints = [
+            cp.constraints.power.PowCone3D(
+                s4 * (1 + kappa) / (2 * kappa) * onesvec,
+                psi4 * (1 + kappa) / kappa,
+                epsilon4,
+                1 / (1 + kappa),
+            ),
+            cp.constraints.power.PowCone3D(
+                omega4 / (1 - kappa),
+                theta4 / kappa,
+                -s4 / (2 * kappa) * onesvec,
+                (1 - kappa),
+            ),
+            U[1:] * 1000 - t4 * 1000 + epsilon4 * 1000 + omega4 * 1000 <= 0,
+        ]
+
+        risk22 = t4 + ln_k * s4 + onesvec.T @ psi4 + onesvec.T @ theta4
+
+        # Entropic Value at Risk Range Model Variables
+
+        t8 = cp.Variable((1, 1))
+        s8 = cp.Variable((1, 1), nonpos=True)
+        u8 = cp.Variable((T, 1))
+        EVaR_G = t8 + s8 * np.log(1 / (beta * T))
+        risk23 = EVaR_L - EVaR_G
+        evrgconstraints = [cp.sum(u8) * 1000 >= s8 * 1000]
+        evrgconstraints += [
+            cp.ExpCone(X * 1000 + t8 * 1000, onesvec @ -s8 * 1000, -u8 * 1000)
+        ]
+
+        # Relativistic Value at Risk Range Variables
+
+        if self.kappa_g is None:
+            kappa_g = kappa
+        else:
+            kappa_g = self.kappa_g
+
+        t9 = cp.Variable((1, 1))
+        s9 = cp.Variable((1, 1), nonpos=True)
+        omega9 = cp.Variable((T, 1))
+        psi9 = cp.Variable((T, 1))
+        theta9 = cp.Variable((T, 1))
+        epsilon9 = cp.Variable((T, 1))
+
+        rvrgconstraints = [
+            cp.constraints.power.PowCone3D(
+                -s9 * (1 + kappa_g) / (2 * kappa_g) * onesvec,
+                -psi9 * (1 + kappa_g) / kappa_g,
+                -epsilon9,
+                1 / (1 + kappa_g),
+            ),
+            cp.constraints.power.PowCone3D(
+                -omega9 / (1 - kappa_g),
+                -theta9 / kappa_g,
+                s9 / (2 * kappa_g) * onesvec,
+                (1 - kappa_g),
+            ),
+            X * 1000 + t9 * 1000 - epsilon9 * 1000 - omega9 * 1000 <= 0,
+        ]
+
+        ln_k_g = ((1 / (beta * T)) ** kappa_g - (1 / (beta * T)) ** (-kappa_g)) / (
+            2 * kappa_g
+        )
+
+        RLVaR_G = t9 + ln_k_g * s9 + cp.sum(psi9 + theta9)
+        risk24 = RLVaR_L - RLVaR_G
+
+        # Even Moment of order 2 * p_em Risk Variables
+
+        p_em = self.p_em
+        u10 = cp.Variable((T, 1))
+        theta10 = cp.Variable((T, 1))
+        g10 = cp.Variable(nonneg=True)
+
+        emconstraints = [
+            cp.sum(u10) <= g10,
+            cp.PowCone3D(u10 * T, g10 * onesvec, theta10, 1 / p_em),
+            cp.PowCone3D(theta10, onesvec, Rc @ w, 1 / 2),
+        ]
+
+        risk25 = g10
+
+        # Even Semi Moment of order 2 * p_esm Risk Variables
+
+        p_esm = self.p_esm
+        y = cp.Variable((T, 1), nonneg=True)
+        u11 = cp.Variable((T, 1))
+        theta11 = cp.Variable((T, 1))
+        g11 = cp.Variable(nonneg=True)
+
+        esmconstraints = [
+            cp.sum(u11) <= g11,
+            cp.PowCone3D(u11 * T, g11 * onesvec, theta11, 1 / p_esm),
+            cp.PowCone3D(theta11, onesvec, y, 1 / 2),
+            y >= -Rc @ w,
+        ]
+
+        risk26 = g11
 
         # Problem Linear Constraints
 
         if self.ainequality is not None and self.binequality is not None:
             A = np.array(self.ainequality, ndmin=2) * 1000
             B = np.array(self.binequality, ndmin=2) * 1000
-            constraints += [A @ w - B @ k >= 0]
+            constraints += [A @ w - B @ k <= 0]
 
         # Problem Return Constraint
 
@@ -2354,22 +4331,20 @@ class Portfolio(object):
             constraints += edarconstraints
         elif rm == "GMD":
             risk = risk14
-            constraints += owaconstraints
             constraints += gmdconstraints
         elif rm == "TG":
             risk = risk15
-            constraints += owaconstraints
             constraints += tgconstraints
         elif rm == "CVRG":
             risk = risk17
-            constraints += owaconstraints
+            constraints += cvarconstraints
             constraints += cvrgconstraints
         elif rm == "TGRG":
             risk = risk18
-            constraints += owaconstraints
+            constraints += tgconstraints
             constraints += tgrgconstraints
         elif rm == "KT":
-            if self.kurt is not None:
+            if kurt is not None:
                 risk = risk19
                 constraints += ktconstraints
             else:
@@ -2384,13 +4359,47 @@ class Portfolio(object):
                 raise ValueError(
                     "First you need to calculate Semi Cokurtosis Square Matrix."
                 )
+        elif rm == "RLVaR":
+            risk = risk21
+            constraints += rlvarconstraints
+        elif rm == "RLDaR":
+            risk = risk22
+            constraints += ddconstraints
+            constraints += rldarconstraints
+        elif rm == "EVRG":
+            risk = risk23
+            constraints += evarconstraints
+            constraints += evrgconstraints
+        elif rm == "RVRG":
+            risk = risk24
+            constraints += rlvarconstraints
+            constraints += rvrgconstraints
+        elif rm == "EM":
+            risk = risk25
+            constraints += emconstraints
+        elif rm == "ESM":
+            risk = risk26
+            constraints += esmconstraints
 
         # Risk budgeting constraint
 
-        c = cp.Variable(nonneg=True)
+        if model == "FC":
+            # log_w = cp.Variable((N_f, 1))
+            constraints += [
+                rb.T @ cp.log(w1) >= 1,
+                # rb.T @ log_w >= 1,
+                # cp.ExpCone(log_w * 1000, np.ones((N_f, 1)) * 1000, w1 * 1000),
+            ]
+        else:
+            log_w = cp.Variable((N, 1))
+            constraints += [
+                w * 1000 >= 0,
+                # rb.T @ cp.log(w) >= 1,
+                rb.T @ log_w >= 1,
+                cp.ExpCone(log_w * 1000, np.ones((N, 1)) * 1000, w * 1000),
+            ]
+
         constraints += [
-            b @ cp.log(w) >= c,
-            w * 1000 >= 0,
             cp.sum(w) * 1000 == k * 1000,
         ]
 
@@ -2420,8 +4429,19 @@ class Portfolio(object):
                 if w.value is not None:
                     break
 
+            if rm == "EVaR":
+                self.z_EVaR = s1.value
+            if rm == "EDaR":
+                self.z_EDaR = s2.value
+            if rm == "RLVaR":
+                self.z_RLVaR = s3.value
+            if rm == "RLDaR":
+                self.z_RLDaR = s4.value
             weights = np.array(w.value, ndmin=2).T
-            weights = np.abs(weights) / np.sum(np.abs(weights))
+            if model == "FC":
+                weights = weights / np.array(k.value)
+            else:
+                weights = np.abs(weights) / np.sum(np.abs(weights))
 
             for j in self.assetslist:
                 portafolio[j].append(weights[0, self.assetslist.index(j)])
@@ -2443,43 +4463,45 @@ class Portfolio(object):
         r"""
         This method that calculates the relaxed risk parity portfolio according
         to the optimization model and version selected by the user
-        :cite:`a-RichardRoncalli`. The general problem that solves is:
-        
+        :cite:`a-GambetaKwon`. The general problem that solves is:
+
         .. math::
             \begin{aligned}
-            &\underset{w}{\min} & & \psi - \gamma & \\
-            &\text{s.t.} & & \zeta = \Sigma w \\
-            & & & w^{T} \Sigma w \leq N \left ( \psi^{2} - \rho^{2} \right ) & \\
-            & & & w_{i} \zeta_{i} \geq \gamma^{2} & \forall i=1 , \ldots , N \\
-            & & & \lambda x^{T} \Theta x \leq \rho^{2} & \\
-            & & & \mu w \geq \overline{\mu} & \\
-            & & & Aw \geq B & \\
-            & & & \sum^{N}_{i=1} w_{i} = 1 & \\
-            & & & \psi, \gamma, \rho, w  \geq 0 & \\
+            \min_{w} & \quad \psi - \gamma \\
+            \text{s.t.} & \quad \zeta = \Sigma w \\
+            & \quad w^{T} \Sigma w \leq \left ( \psi^{2} - \rho^{2} \right ) \\
+            & \quad w_{i} \zeta_{i} \geq \gamma^{2} \mathbf{b}_{i} & \forall i=1 , \ldots , N \\
+            & \quad \lambda w^{T} \Theta w \leq \rho^{2} \\
+            & \quad \mu w \geq \overline{\mu} \\
+            & \quad Aw \leq b \\
+            & \quad \sum^{N}_{i=1} w_{i} = 1 \\
+            & \quad \psi, \gamma, \rho, w  \geq 0 \\
             \end{aligned}
-        
+
         Where:
-    
+
         :math:`w`: is the vector of weights of the optimum portfolio.
-        
+
         :math:`\mu`: is the vector of expected returns.
-        
+
         :math:`\Sigma`: is the covariance matrix of assets returns.
-        
+
         :math:`\psi`: is the average risk of the portfolio.
-        
+
         :math:`\gamma`: is the lower bound of each asset risk constribution.
-        
+
+        :math:`\mathbf{b}`: is the vector of risk constribution targets.
+
         :math:`\zeta_{i}`: is the marginal risk of asset :math:`i`.
-        
+
         :math:`\rho`: is a regularization variable.
-        
+
         :math:`\lambda`: is a penalty parameter of :math:`\rho`.
-        
+
         :math:`\Theta = \text{diag}(\Sigma)`
-        
-        :math:`Aw \geq B`: is a set of linear constraints.
-        
+
+        :math:`Aw \leq b`: is a set of linear constraints on asset weights.
+
         Parameters
         ----------
         model : str can be 'Classic' or 'FM'
@@ -2488,15 +4510,15 @@ class Portfolio(object):
 
             - 'Classic': use estimates of expected return vector and covariance matrix that depends on historical data.
             - 'FM': use estimates of expected return vector and covariance matrix based on a Risk Factor model specified by the user.
-            
+
         version : str can be 'A', 'B' or 'C'
             Relaxed risk parity model version proposed in :cite:`a-RichardRoncalli`.
             The default is 'A'. Possible values are:
-                
+
             - 'A': without regularization and penalization constraints.
             - 'B': with regularization constraint but without penalization constraint.
             - 'C': with regularization and penalization constraints.
-            
+
         l : float, optional
             The penalization factor of penalization constraints. Only used with
             version 'C'. The default is 1.
@@ -2504,14 +4526,14 @@ class Portfolio(object):
             The vector of risk constraints per asset.
             The default is 1/n (number of assets).
         hist : bool, optional
-            Indicate what kind of covariance matrix is used. 
+            Indicate what kind of covariance matrix is used.
             If model = 'FM', True means historical covariance and
             False means Risk Factor model for covariance. The default is
             True.
-            
+
         Returns
         -------
-        w : DataFrame
+        rrp_optimal : DataFrame
             The weights of optimal portfolio.
 
         """
@@ -2536,13 +4558,17 @@ class Portfolio(object):
 
         # General Model Variables
 
+        T, N = returns.shape
+
         if b is None:
-            b = np.ones((1, mu.shape[1]))
-            b = b / mu.shape[1]
+            rb = np.ones((N, 1))
+            rb = rb / N
+        else:
+            self.b = b.copy()
+            rb = self.b
 
         returns = np.array(returns, ndmin=2)
         w = cp.Variable((mu.shape[1], 1))
-        n = returns.shape[1]
         ret = mu @ w
 
         # RRP Model Variables
@@ -2557,8 +4583,7 @@ class Portfolio(object):
 
         # General Model Constraints
 
-        constraints = []
-        constraints += [
+        constraints = [
             zeta == sigma @ w,
             cp.sum(w) == 1,
             gamma >= 0,
@@ -2570,39 +4595,38 @@ class Portfolio(object):
         for i in range(mu.shape[1]):
             constraints += [
                 cp.SOC(
-                    w[i, 0] + zeta[i, 0], cp.vstack([2 * gamma, w[i, 0] - zeta[i, 0]])
+                    w[i, 0] + zeta[i, 0],
+                    cp.vstack([2 * gamma * rb[i] ** 0.5, w[i, 0] - zeta[i, 0]]),
                 )
             ]
 
         # Specific Model Constraints
 
         if version == "A":
-            constraints += [cp.SOC(n**0.5 * psi, G.T @ w)]
+            constraints += [cp.SOC(psi, G.T @ w)]
         elif version == "B":
             constraints += [
                 cp.SOC(
-                    2 * n**0.5 * psi,
-                    cp.vstack([2 * G.T @ w, -2 * n**0.5 * rho * np.ones((1, 1))]),
+                    2 * psi,
+                    cp.vstack([2 * G.T @ w, -2 * rho * np.ones((1, 1))]),
                 )
             ]
             constraints += [cp.SOC(rho, G.T @ w)]
-            constraints += [rho >= 0]
         elif version == "C":
             constraints += [
                 cp.SOC(
-                    2 * n**0.5 * psi,
-                    cp.vstack([2 * G.T @ w, -2 * n**0.5 * rho * np.ones((1, 1))]),
+                    2 * psi,
+                    cp.vstack([2 * G.T @ w, -2 * rho * np.ones((1, 1))]),
                 )
             ]
             constraints += [cp.SOC(rho, l**0.5 * Theta.T @ w)]
-            constraints += [rho >= 0]
 
         # Problem Linear Constraints
 
         if self.ainequality is not None and self.binequality is not None:
             A = np.array(self.ainequality, ndmin=2) * 1000
             B = np.array(self.binequality, ndmin=2) * 1000
-            constraints += [A @ w - B >= 0]
+            constraints += [A @ w - B <= 0]
 
         # Problem Return Constraint
 
@@ -2645,14 +4669,14 @@ class Portfolio(object):
             pass
 
         try:
-            self.rp_optimal = pd.DataFrame(
+            self.rrp_optimal = pd.DataFrame(
                 portafolio, index=["weights"], dtype=np.float64
             ).T
         except:
-            self.rp_optimal = None
+            self.rrp_optimal = None
             print("The problem doesn't have a solution with actual input parameters")
 
-        return self.rp_optimal
+        return self.rrp_optimal
 
     def wc_optimization(self, obj="Sharpe", rf=0, l=2, Umu="box", Ucov="box"):
         r"""
@@ -2695,7 +4719,7 @@ class Portfolio(object):
 
         Returns
         -------
-        w : DataFrame
+        wc_optimal : DataFrame
             The weights of optimal portfolio.
 
         """
@@ -2718,7 +4742,6 @@ class Portfolio(object):
         w = cp.Variable((N, 1))
         Au = cp.Variable((N, N), symmetric=True)
         Al = cp.Variable((N, N), symmetric=True)
-        X = cp.Variable((N, N), symmetric=True)
         Z = cp.Variable((N, N), symmetric=True)
 
         k = cp.Variable((1, 1))
@@ -2730,52 +4753,79 @@ class Portfolio(object):
         # Uncertainty Sets for Mean Vector
 
         if Umu == "box":
-            if obj == "Sharpe":
-                constraints += [mu @ w - d_mu @ cp.abs(w) - rf0 * k >= 1]
-            else:
-                ret = mu @ w - d_mu @ cp.abs(w)
+            #            if obj == "Sharpe":
+            #                constraints += [mu @ w - d_mu @ cp.abs(w) - rf0 * k >= 1]
+            #            else:
+            ret = mu @ w - d_mu @ cp.abs(w)
         elif Umu == "ellip":
-            if obj == "Sharpe":
-                constraints += [
-                    mu @ w - k_mu * cp.pnorm(sqrtm(cov_mu) @ w, 2) - rf0 * k >= 1
-                ]
-            else:
-                ret = mu @ w - k_mu * cp.pnorm(sqrtm(cov_mu) @ w, 2)
+            #            if obj == "Sharpe":
+            #                constraints += [
+            #                    mu @ w - k_mu * cp.pnorm(sqrtm(cov_mu) @ w, 2) - rf0 * k >= 1
+            #                ]
+            #            else:
+            ret = mu @ w - k_mu * cp.pnorm(sqrtm(cov_mu) @ w, 2)
         else:
+            #            if obj == "Sharpe":
+            #                constraints += [mu @ w - rf0 * k >= 1]
+            #            else:
+            ret = mu @ w
+
+        # SDP Model Variables
+
+        sdpmodel = False
+        if (
+            self.network_sdp is not None
+            or self.cluster_sdp is not None
+            or Ucov in ["box", "ellip"]
+        ):
+            sdpmodel = True
+
+        if sdpmodel:
+            W = cp.Variable((N, N), symmetric=True)
+            M1 = cp.vstack([W, w.T])
             if obj == "Sharpe":
-                constraints += [mu @ w - rf0 * k >= 1]
+                M2 = cp.vstack([w, k])
             else:
-                ret = mu @ w
+                M2 = cp.vstack([w, np.ones((1, 1))])
+            M3 = cp.hstack([M1, M2])
+            sdpconstraints = [M3 >> 0]
 
         # Uncertainty Sets for Covariance Matrix
 
         if Ucov == "box":
-            M1 = cp.vstack([Au - Al, w.T])
-            if obj == "Sharpe":
-                M2 = cp.vstack([w, k])
-            else:
-                M2 = cp.vstack([w, np.ones((1, 1))])
-            M = cp.hstack([M1, M2])
             risk = cp.trace(Au @ cov_u) - cp.trace(Al @ cov_l)
-            constraints += [M >> 0, Au >= 0, Al >= 0]
+            constraints += [W == Au - Al, Au >= 0, Al >= 0]
         elif Ucov == "ellip":
-            M1 = cp.vstack([X, w.T])
-            if obj == "Sharpe":
-                M2 = cp.vstack([w, k])
-            else:
-                M2 = cp.vstack([w, np.ones((1, 1))])
-            M = cp.hstack([M1, M2])
-            risk = cp.trace(sigma @ (X + Z))
-            risk += k_sigma * cp.pnorm(sqrtm(cov_sigma) @ (cp.vec(X) + cp.vec(Z)), 2)
-            constraints += [M >> 0, Z >> 0]
+            risk = cp.trace(sigma @ (W + Z))
+            risk += k_sigma * cp.pnorm(
+                sqrtm(cov_sigma) @ (cp.vec(W, order="F") + cp.vec(Z, order="F")), 2
+            )
+            constraints += [Z >> 0]
         else:
-            G = sqrtm(sigma)
-            risk = g**2
-            constraints += [cp.SOC(g, G.T @ w)]
+            if sdpmodel:
+                risk = cp.trace(sigma @ w)
+            else:
+                G = sqrtm(sigma)
+                risk = g**2
+                constraints += [cp.SOC(g, G.T @ w)]
 
-        # Cardinal Boolean Variables
+        # Boolean Variables
 
-        if self.card is not None:
+        flag_int = False
+        if (
+            self.card is not None
+            or self.network_ip is not None
+            or self.cluster_ip is not None
+            or (
+                self.aintinequality is not None
+                and self.bintinequality is not None
+                and self.cintinequality is not None
+                and self.dintinequality is not None
+                and self.eintinequality is not None
+                and self.fintinequality is not None
+            )
+        ):
+            flag_int = True
             if obj == "Sharpe":
                 e = cp.Variable((mu.shape[1], 1), boolean=True)
                 e1 = cp.Variable((mu.shape[1], 1))
@@ -2785,55 +4835,133 @@ class Portfolio(object):
         # Problem Weight Constraints
 
         if obj == "Sharpe":
-            constraints += [cp.sum(w) == self.budget * k, k >= 0]
+            constraints += [cp.sum(w) == self.budget * k, k * 1000 >= 0]
             if self.sht == False:
-                constraints += [w <= self.upperlng * k, w >= 0]
-                if self.card is not None:
+                constraints += [w * 1000 >= 0]
+                if flag_int:
                     constraints += [
-                        cp.sum(e) <= self.card,
                         e1 <= k,
                         e1 >= 0,
                         e1 <= 100000 * e,
                         e1 >= k - 100000 * (1 - e),
                         w <= self.upperlng * e1,
+                        w >= self.lowerlng * e1,
+                    ]
+                else:
+                    constraints += [
+                        w <= self.upperlng * k,
+                        w >= self.lowerlng * k,
                     ]
             elif self.sht == True:
                 constraints += [
-                    cp.sum(cp.pos(w)) * 1000 <= self.upperlng * k * 1000,
-                    cp.sum(cp.neg(w)) * 1000 <= self.uppersht * k * 1000,
+                    cp.sum(cp.pos(w)) * 1000
+                    <= (self.budget + self.budgetsht) * k * 1000,
+                    cp.sum(cp.neg(w)) * 1000 <= self.budgetsht * k * 1000,
                 ]
-                if self.card is not None:
+                if flag_int:
                     constraints += [
-                        cp.sum(e) <= self.card,
                         e1 <= k,
                         e1 >= 0,
                         e1 <= 100000 * e,
                         e1 >= k - 100000 * (1 - e),
-                        w >= -self.uppersht * e1,
-                        w <= self.upperlng * e1,
+                        w >= -min(self.uppersht, self.budgetsht) * e1,
+                        w <= min(self.upperlng, (self.budget + self.budgetsht)) * e1,
                     ]
-
+                else:
+                    constraints += [
+                        w >= -min(self.uppersht, self.budgetsht) * k,
+                        w <= min(self.upperlng, (self.budget + self.budgetsht)) * k,
+                    ]
         else:
             constraints += [cp.sum(w) == self.budget]
             if self.sht == False:
-                constraints += [w <= self.upperlng, w >= 0]
-                if self.card is not None:
+                constraints += [w * 1000 >= 0]
+                if flag_int:
                     constraints += [
-                        cp.sum(e) <= self.card,
                         w <= self.upperlng * e,
+                        w >= self.lowerlng * e,
                     ]
-
+                else:
+                    constraints += [
+                        w <= self.upperlng,
+                        w >= self.lowerlng,
+                    ]
             elif self.sht == True:
                 constraints += [
-                    cp.sum(cp.pos(w)) * 1000 <= self.upperlng * 1000,
-                    cp.sum(cp.neg(w)) * 1000 <= self.uppersht * 1000,
+                    cp.sum(cp.pos(w)) * 1000 <= (self.budget + self.budgetsht) * 1000,
+                    cp.sum(cp.neg(w)) * 1000 <= self.budgetsht * 1000,
                 ]
-                if self.card is not None:
+                if flag_int:
                     constraints += [
-                        cp.sum(e) <= self.card,
-                        w >= -self.uppersht * e,
-                        w <= self.upperlng * e,
+                        w >= -min(self.uppersht, self.budgetsht) * e,
+                        w <= min(self.upperlng, (self.budget + self.budgetsht)) * e,
                     ]
+                else:
+                    constraints += [
+                        w >= -min(self.uppersht, self.budgetsht),
+                        w <= min(self.upperlng, (self.budget + self.budgetsht)),
+                    ]
+
+        if flag_int:
+
+            # Cardinality Constraint
+
+            if self.card is not None:
+                constraints += [
+                    cp.sum(e) <= self.card,
+                ]
+
+            # Integer Constraint
+
+            if (
+                self.aintinequality is not None
+                and self.bintinequality is not None
+                and self.cintinequality is not None
+                and self.dintinequality is not None
+                and self.eintinequality is not None
+                and self.fintinequality is not None
+            ):
+                e_set = {}
+                for key in self.aintinequality.keys():
+                    if min(self.aintinequality[key].shape) > 0:
+                        constraints += [
+                            self.aintinequality[key] @ e <= self.bintinequality[key]
+                        ]
+                    if min(self.cintinequality[key].shape) > 0:
+                        e_set[key] = cp.Variable(
+                            (self.cintinequality[key].shape[0], 1), boolean=True
+                        )
+                        constraints += [
+                            self.cintinequality[key] @ e
+                            <= cp.multiply(self.dintinequality[key], e_set[key]),
+                            self.eintinequality[key] @ e_set[key]
+                            <= self.fintinequality[key],
+                        ]
+
+            # Network IP Constraint
+
+            if self.network_ip is not None:
+                constraints += [
+                    np.unique(self.network_ip + np.identity(N), axis=0) @ e <= 1
+                ]
+
+            # Cluster IP Constraint
+
+            if self.cluster_ip is not None:
+                constraints += [
+                    np.unique(self.cluster_ip + np.identity(N), axis=0) @ e <= 1
+                ]
+        else:
+
+            # Network SDP Constraint
+
+            if self.network_sdp is not None:
+                constraints += [cp.multiply(self.network_sdp, W) == 0]
+
+            # Cluster SDP Constraint
+
+            if self.cluster_sdp is not None:
+                constraints += [cp.multiply(self.cluster_sdp, W) == 0]
 
         # Number of effective assets constraints
 
@@ -2851,15 +4979,15 @@ class Portfolio(object):
         elif self.kindbench == False:
             bench = np.array(self.benchindex, ndmin=2)
 
-        # Problem additional linear constraints
+        # Problem Linear Constraints
 
         if self.ainequality is not None and self.binequality is not None:
             A = np.array(self.ainequality, ndmin=2) * 1000
             B = np.array(self.binequality, ndmin=2) * 1000
             if obj == "Sharpe":
-                constraints += [A @ w - B @ k >= 0]
+                constraints += [A @ w - B @ k <= 0]
             else:
-                constraints += [A @ w - B >= 0]
+                constraints += [A @ w - B <= 0]
 
         # Tracking error Constraints
 
@@ -2883,10 +5011,22 @@ class Portfolio(object):
                 TO_1 = cp.abs(w - c) * 1000
                 constraints += [TO_1 <= self.turnover * 1000]
 
+        # Problem centrality measures constraints
+
+        if self.acentrality is not None and self.bcentrality is not None:
+            if obj == "Sharpe":
+                constraints += [self.acentrality @ w == self.bcentrality * k]
+            else:
+                constraints += [self.acentrality @ w == self.bcentrality]
+
+        # SDP constraints
+
+        if sdpmodel == True:
+            constraints += sdpconstraints
+
         # Frontier Variables
 
         portafolio = {}
-
         for i in self.assetslist:
             portafolio.update({i: []})
 
@@ -2894,13 +5034,15 @@ class Portfolio(object):
 
         # Defining objective function
         if obj == "Sharpe":
-            objective = cp.Minimize(risk)
+            #            objective = cp.Minimize(risk * 1000)
+            objective = cp.Maximize(ret * 1000 - rf0 * k * 1000)
+            constraints += [risk <= 1]
         elif obj == "MinRisk":
-            objective = cp.Minimize(risk)
+            objective = cp.Minimize(risk * 1000)
         elif obj == "Utility":
-            objective = cp.Maximize(ret - l * risk)
+            objective = cp.Maximize(ret * 1000 - l * risk * 1000)
         elif obj == "MaxRet":
-            objective = cp.Maximize(ret)
+            objective = cp.Maximize(ret * 1000)
 
         try:
             prob = cp.Problem(objective, constraints)
@@ -2939,26 +5081,47 @@ class Portfolio(object):
 
         return self.wc_optimal
 
-    def owa_optimization(self, obj="Sharpe", owa_w=None, kelly=False, rf=0, l=2):
+    def frc_optimization(
+        self, model="Classic", obj="Sharpe", kelly=None, rf=0, l=2, hist=True
+    ):
         r"""
-        This method that calculates the owa optimal portfolio according to the
-        weight vector given by the user. The general problem that
-        solves is:
-        
+        This method that calculates the risk parity portfolio using the risk
+        budgeting approach :cite:`a-Cajas13` according to the objective function
+        selected by the user. The general problem that solves is:
+
         .. math::
-            \begin{align}
-            &\underset{w}{\text{optimize}} & & F(w)\\
-            &\text{s. t.} & & Aw \geq B\\
-            \end{align}
-        
+            \begin{aligned}
+            \underset{w_{f}}{\text{optimize}} & \quad F(w)\\
+            \text{s.t.} & \quad \begin{bmatrix} W_{\text{f}}  & w_{\text{f}} \\ w^{\prime}_{\text{f}} & 1 \end{bmatrix} \succeq 0 \\
+            & \quad A w \leq b \\
+            & \quad w = (B^{\prime})^{+} w_{\text{f}} \\
+            & \quad A_{\text{frc}} \text{diag}\left ( \bar{\Sigma} W_{\text{f}} \right) \leq b_{\text{frc}} \, \text{Tr} \left ( \bar{\Sigma} W_{\text{f}} \right ) \\
+            & \quad W_{\text{f}} \in \mathbf{S}^{n}\\
+            \end{aligned}
+
         Where:
-            
-        :math:`F(w)` is the objective function based on an owa risk measure.
-    
-        :math:`Aw \geq B` is a set of linear constraints.
-        
+
+        :math:`w_f` are the weights of the risk factors.
+
+        :math:`W_f`: is the symmetric matrix variable that approximates :math:`w_f w^{\prime}_f`.
+
+        :math:`B` is the loadings matrix.
+
+        :math:`Aw \leq b`: is a set of linear constraints on asset weights.
+
+        :math:`\bar{\Sigma} = \left ((B^{\prime})^{+} \right )^{\prime} \Sigma (B^{\prime})^{+} $, $X_{\text{f}}`.
+
+        :math:`A_{\text{frc}} \text{diag}\left ( \bar{\Sigma} W_{\text{f}} \right) \leq b_{\text{frc}} \, \text{Tr} \left ( \bar{\Sigma} W_{\text{f}} \right )`: is a set of linear factor risk contribution constraints.
+
         Parameters
         ----------
+        model : str can be 'Classic' or 'FM'
+            The model used for optimize the portfolio.
+            The default is 'Classic'. Possible values are:
+
+            - 'Classic': uses estimates of expected return vector and covariance matrix that depends on historical data.
+            - 'FM': uses estimates of expected return vector and covariance matrix based on a Risk Factor model specified by the user.
+
         obj : str can be {'MinRisk', 'Utility', 'Sharpe' or 'MaxRet'}.
             Objective function of the optimization model.
             The default is 'Sharpe'. Possible values are:
@@ -2966,137 +5129,157 @@ class Portfolio(object):
             - 'MinRisk': Minimize the selected risk measure.
             - 'Utility': Maximize the Utility function :math:`\mu w - l \phi_{i}(w)`.
             - 'Sharpe': Maximize the risk adjusted return ratio based on the selected risk measure.
-            
-        owa_w : 1darray, optional
-            The owa weight used to define the owa risk measure.
-            The default is 'MV'. Possible values are:
+            - 'MaxRet': Maximize the expected return of the portfolio.
+
         kelly : str, optional
-            Method used to calculate mean return. Possible values are False for
-            arithmetic mean return, "approx" for approximate mean logarithmic 
+            Method used to calculate mean return. Possible values are: None for
+            arithmetic mean return, "approx" for approximate mean logarithmic
             return using first and second moment and "exact" for mean logarithmic
-            return. The default is False.
+            return. The default is None.
         rf : float, optional
             Risk free rate, must be in the same period of assets returns.
             The default is 0.
         l : scalar, optional
             Risk aversion factor of the 'Utility' objective function.
             The default is 2.
+        hist : bool, optional
+            Indicate what kind of returns are used to calculate risk measures
+            that depends on scenarios (All except 'MV' risk measure).
+            If model = 'FM', True means historical covariance and returns and
+            False means Risk Factor model for covariance and returns. The
+            default is True.
 
         Returns
         -------
-        w : DataFrame
+        frc_optimal : DataFrame
             The weights of optimal portfolio.
 
         """
 
         # General model Variables
 
-        mu = self.mu.to_numpy()
-        sigma = self.cov.to_numpy()
-        returns = self.returns.to_numpy()
-        w = cp.Variable((mu.shape[1], 1))
-        k = cp.Variable((1, 1))
-        rf0 = rf
+        mu = None
+        sigma = None
+        if model in ["Classic"]:
+            mu = np.array(self.mu, ndmin=2)
+            sigma = np.array(self.cov, ndmin=2)
+            returns = np.array(self.returns, ndmin=2)
+        elif model == "FM":
+            mu = np.array(self.mu_fm, ndmin=2)
+            if hist == False:
+                sigma = np.array(self.cov_fm, ndmin=2)
+                returns = np.array(self.returns_fm, ndmin=2)
+            elif hist == True:
+                sigma = np.array(self.cov, ndmin=2)
+                returns = np.array(self.returns, ndmin=2)
+
+        # General Model Variables
+
         T, N = returns.shape
+        onesvec = np.ones((T, 1))
+
+        if self.B.shape[1] == len(self.factorslist):
+            B1 = self.B.to_numpy()
+        else:
+            B1 = self.B.to_numpy()[:, 1:]
+
+        if self.feature_selection == "PCR":
+            scaler = StandardScaler()
+            scaler.fit(self.factors)
+            X_std = scaler.transform(self.factors)
+            if self.n_components > 0 and self.n_components < 1:
+                pca = PCA(n_components=self.n_components)
+            elif self.n_components >= 1:
+                pca = PCA(n_components=int(self.n_components))
+            pca.fit(X_std)
+            V_p = pca.components_.T
+            std = np.array(np.std(self.factors, axis=0, ddof=1), ndmin=2)
+            B1 = (pinv(V_p) @ (B1.T * std.T)).T
+
+        B2 = pinv(B1.T)
+        N_f = B2.shape[1]
+        w1 = cp.Variable((N_f, 1))
+        w = B2 @ w1
+
+        k = cp.Variable((1, 1))
         gr = cp.Variable((T, 1))
-
-        # MV Model Variables (for approx log returns)
-
         g = cp.Variable(nonneg=True)
-        G = sqrtm(sigma)
-        devconstraints = [cp.SOC(g, G.T @ w)]
+        rf0 = rf
+
+        constraints = []
+
+        # Variance Variables
+
+        W1 = cp.Variable((N_f, N_f), symmetric=True)
+        M1 = cp.vstack([W1, w1.T])
+        if obj == "Sharpe":
+            M2 = cp.vstack([w1, k])
+        else:
+            M2 = cp.vstack([w1, np.ones((1, 1))])
+        M3 = cp.hstack([M1, M2])
+
+        risk = cp.trace(B2.T @ sigma @ B2 @ W1)
+        constraints += [M3 >> 0]
 
         # Return Variables
 
-        if kelly == "exact":
-            if obj == "Sharpe":
-                ret = 1 / T * cp.sum(gr) - rf0 * k
-            else:
-                ret = 1 / T * cp.sum(cp.log(1 + returns @ w))
-        elif kelly == "approx":
-            if obj == "Sharpe":
-                ret = mu @ w - 0.5 * cp.quad_over_lin(g, k)
-            else:
-                ret = mu @ w - 0.5 * g**2
-        elif kelly == False:
+        if model == "Classic":
+            if kelly == "exact":
+                if obj == "Sharpe":
+                    ret = 1 / T * cp.sum(gr)
+                    constraints += [cp.ExpCone(gr, onesvec @ k, k + returns @ w)]
+                else:
+                    ret = 1 / T * cp.sum(cp.log(1 + returns @ w))
+            elif kelly == "approx":
+                if obj == "Sharpe":
+                    ret = mu @ w - 0.5 * cp.quad_over_lin(g, k)
+                    constraints += [cp.SOC(g, sqrtm(sigma) @ w)]
+                else:
+                    ret = mu @ w - 0.5 * g**2
+            elif kelly is None:
+                ret = mu @ w
+        else:
             ret = mu @ w
-
-        # OWA Model Variables
-
-        a = cp.Variable((T, 1))
-        b = cp.Variable((T, 1))
-        y = cp.Variable((T, 1))
-        risk = cp.sum(a + b)
-
-        constraints = []
-        constraints += [returns @ w == y]
-        if owa_w is None:
-            owa_w = owa.owa_gmd(T) / 2
-
-        onesvec = np.ones((T, 1))
-        constraints += [y @ owa_w.T <= onesvec @ a.T + b @ onesvec.T]
-
-        # Cardinal Boolean Variables
-
-        if self.card is not None:
-            if obj == "Sharpe":
-                e = cp.Variable((mu.shape[1], 1), boolean=True)
-                e1 = cp.Variable((mu.shape[1], 1))
-            else:
-                e = cp.Variable((mu.shape[1], 1), boolean=True)
 
         # Problem Weight Constraints
 
         if obj == "Sharpe":
             constraints += [cp.sum(w) == self.budget * k, k * 1000 >= 0]
             if self.sht == False:
-                constraints += [w <= self.upperlng * k, w * 1000 >= 0]
-                if self.card is not None:
-                    constraints += [
-                        cp.sum(e) <= self.card,
-                        e1 <= k,
-                        e1 >= 0,
-                        e1 <= 100000 * e,
-                        e1 >= k - 100000 * (1 - e),
-                        w <= self.upperlng * e1,
-                    ]
+                constraints += [
+                    w <= self.upperlng * k,
+                    w >= self.lowerlng * k,
+                    w * 1000 >= 0,
+                ]
             elif self.sht == True:
                 constraints += [
-                    cp.sum(cp.pos(w)) * 1000 <= self.upperlng * k * 1000,
-                    cp.sum(cp.neg(w)) * 1000 <= self.uppersht * k * 1000,
+                    cp.sum(cp.pos(w)) * 1000
+                    <= (self.budget + self.budgetsht) * k * 1000,
+                    cp.sum(cp.neg(w)) * 1000 <= self.budgetsht * k * 1000,
+                    w >= -min(self.uppersht, self.budgetsht) * k * 1000,
+                    w <= min(self.upperlng, (self.budget + self.budgetsht)) * k * 1000,
                 ]
-                if self.card is not None:
-                    constraints += [
-                        cp.sum(e) <= self.card,
-                        e1 <= k,
-                        e1 >= 0,
-                        e1 <= 100000 * e,
-                        e1 >= k - 100000 * (1 - e),
-                        w >= -self.uppersht * e1,
-                        w <= self.upperlng * e1,
-                    ]
-
         else:
             constraints += [cp.sum(w) == self.budget]
             if self.sht == False:
-                constraints += [w <= self.upperlng, w * 1000 >= 0]
-                if self.card is not None:
-                    constraints += [
-                        cp.sum(e) <= self.card,
-                        w <= self.upperlng * e,
-                    ]
-
+                constraints += [w <= self.upperlng, w >= self.lowerlng, w * 1000 >= 0]
             elif self.sht == True:
                 constraints += [
-                    cp.sum(cp.pos(w)) * 1000 <= self.upperlng * 1000,
-                    cp.sum(cp.neg(w)) * 1000 <= self.uppersht * 1000,
+                    cp.sum(cp.pos(w)) * 1000 <= (self.budget + self.budgetsht) * 1000,
+                    cp.sum(cp.neg(w)) * 1000 <= self.budgetsht * 1000,
+                    w >= -min(self.uppersht, self.budgetsht) * 1000,
+                    w <= min(self.upperlng, (self.budget + self.budgetsht)) * 1000,
                 ]
-                if self.card is not None:
-                    constraints += [
-                        cp.sum(e) <= self.card,
-                        w >= -self.uppersht * e,
-                        w <= self.upperlng * e,
-                    ]
+
+        # Network SDP Constraint
+
+        if self.network_sdp is not None:
+            constraints += [cp.multiply(self.network_sdp, W1) == 0]
+
+        # Cluster SDP Constraint
+
+        if self.cluster_sdp is not None:
+            constraints += [cp.multiply(self.cluster_sdp, W1) == 0]
 
         # Problem Linear Constraints
 
@@ -3104,9 +5287,20 @@ class Portfolio(object):
             A = np.array(self.ainequality, ndmin=2) * 1000
             B = np.array(self.binequality, ndmin=2) * 1000
             if obj == "Sharpe":
-                constraints += [A @ w - B @ k >= 0]
+                constraints += [A @ w - B @ k <= 0]
             else:
-                constraints += [A @ w - B >= 0]
+                constraints += [A @ w - B <= 0]
+
+        # Problem Linear Risk Contribution Constraints
+
+        if self.afrcinequality is not None and self.bfrcinequality is not None:
+            A_frc = np.array(self.afrcinequality, ndmin=2) * 1000
+            B_frc = np.array(self.bfrcinequality, ndmin=2) * 1000
+            constraints += [
+                A_frc @ cp.reshape(cp.diag(B2.T @ sigma @ B2 @ W1), (N_f, 1), order="F")
+                - B_frc * risk
+                <= 0
+            ]
 
         # Number of Effective Assets Constraints
 
@@ -3154,6 +5348,438 @@ class Portfolio(object):
             else:
                 constraints += [ret >= self.lowerret]
 
+        # Problem centrality measures constraints
+
+        if self.acentrality is not None and self.bcentrality is not None:
+            if obj == "Sharpe":
+                constraints += [self.acentrality @ w == self.bcentrality * k]
+            else:
+                constraints += [self.acentrality @ w == self.bcentrality]
+
+        # Problem risk Constraints
+
+        if self.upperdev is not None:
+            if obj == "Sharpe":
+                constraints += [risk <= self.upperdev**2 * k]
+            else:
+                constraints += [risk <= self.upperdev**2]
+
+        # Frontier Variables
+
+        portafolio = {}
+
+        for i in self.assetslist:
+            portafolio.update({i: []})
+
+        # Optimization Process
+
+        # Defining objective function
+        if obj == "Sharpe":
+            if model == "Classic":
+                if kelly == "exact":
+                    constraints += [risk <= 1]
+                    objective = cp.Maximize(ret * 1000 - rf0 * k * 1000)
+                elif kelly == "approx":
+                    constraints += [risk <= 1]
+                    objective = cp.Maximize(ret - rf0 * k)
+                elif kelly is None:
+                    if (mu < 0).all():
+                        constraints += [risk <= 1]
+                        objective = cp.Maximize(ret - rf0 * k)
+                    else:
+                        constraints += [ret - rf0 * k == 1]
+                        objective = cp.Minimize(risk * 1000)
+            else:
+                if (mu < 0).all():
+                    constraints += [risk <= 1]
+                    objective = cp.Maximize(ret - rf0 * k)
+                else:
+                    constraints += [ret - rf0 * k == 1]
+                    objective = cp.Minimize(risk * 1000)
+        elif obj == "MinRisk":
+            objective = cp.Minimize(risk * 1000)
+        elif obj == "Utility":
+            objective = cp.Maximize(ret - l * risk)
+        elif obj == "MaxRet":
+            objective = cp.Maximize(ret * 1000)
+
+        try:
+            prob = cp.Problem(objective, constraints)
+            for solver in self.solvers:
+                try:
+                    if len(self.sol_params) == 0:
+                        prob.solve(solver=solver)
+                    else:
+                        prob.solve(solver=solver, **self.sol_params[solver])
+                except:
+                    pass
+                if w.value is not None:
+                    break
+
+            if obj == "Sharpe":
+                weights = np.array(w.value / k.value, ndmin=2).T
+            else:
+                weights = np.array(w.value, ndmin=2).T
+
+            if self.sht == False:
+                weights = np.abs(weights) / np.sum(np.abs(weights)) * self.budget
+
+            for j in self.assetslist:
+                portafolio[j].append(weights[0, self.assetslist.index(j)])
+
+        except:
+            pass
+
+        try:
+            self.frc_optimal = pd.DataFrame(
+                portafolio, index=["weights"], dtype=np.float64
+            ).T
+        except:
+            self.frc_optimal = None
+            print("The problem doesn't have a solution with actual input parameters")
+
+        return self.frc_optimal
+
+    def owa_optimization(self, obj="Sharpe", owa_w=None, kelly=None, rf=0, l=2):
+        r"""
+        This method that calculates the owa optimal portfolio according to the
+        weight vector given by the user. The general problem that
+        solves is:
+
+        .. math::
+            \begin{align}
+            &\underset{w}{\text{optimize}} & & F(w)\\
+            &\text{s. t.} & & Aw \leq b\\
+            \end{align}
+
+        Where:
+
+        :math:`F(w)` is the objective function based on an owa risk measure.
+
+        :math:`Aw \leq b` is a set of linear constraints on asset weights.
+
+        Parameters
+        ----------
+        obj : str can be {'MinRisk', 'Utility', 'Sharpe' or 'MaxRet'}.
+            Objective function of the optimization model.
+            The default is 'Sharpe'. Possible values are:
+
+            - 'MinRisk': Minimize the selected risk measure.
+            - 'Utility': Maximize the Utility function :math:`\mu w - l \phi_{i}(w)`.
+            - 'Sharpe': Maximize the risk adjusted return ratio based on the selected risk measure.
+            - 'MaxRet': Maximize the expected return of the portfolio.
+
+        owa_w : 1darray, optional
+            The owa weight used to define the owa risk measure.
+            The default is 'MV'. Possible values are:
+        kelly : str, optional
+            Method used to calculate mean return. Possible values are: None for
+            arithmetic mean return, "approx" for approximate mean logarithmic
+            return using first and second moment and "exact" for mean logarithmic
+            return. The default is None.
+        rf : float, optional
+            Risk free rate, must be in the same period of assets returns.
+            The default is 0.
+        l : scalar, optional
+            Risk aversion factor of the 'Utility' objective function.
+            The default is 2.
+
+        Returns
+        -------
+        owa_optimal : DataFrame
+            The weights of optimal portfolio.
+
+        """
+
+        # General model Variables
+
+        mu = np.array(self.mu, ndmin=2)
+        sigma = np.array(self.cov, ndmin=2)
+        returns = np.array(self.returns, ndmin=2)
+
+        w = cp.Variable((mu.shape[1], 1))
+        k = cp.Variable((1, 1))
+        rf0 = rf
+        T, N = returns.shape
+        gr = cp.Variable((T, 1))
+
+        # MV Model Variables (for approx log returns)
+
+        g = cp.Variable(nonneg=True)
+        G = sqrtm(sigma)
+        devconstraints = [cp.SOC(g, G.T @ w)]
+
+        # Return Variables
+
+        if kelly == "exact":
+            if obj == "Sharpe":
+                ret = 1 / T * cp.sum(gr)
+            else:
+                ret = 1 / T * cp.sum(cp.log(1 + returns @ w))
+        elif kelly == "approx":
+            if obj == "Sharpe":
+                ret = mu @ w - 0.5 * cp.quad_over_lin(g, k)
+            else:
+                ret = mu @ w - 0.5 * g**2
+        elif kelly is None:
+            ret = mu @ w
+
+        # SDP Model Variables
+
+        penalty_factor = cp.Constant(0)
+        sdpmodel = False
+        if self.network_sdp is not None or self.cluster_sdp is not None:
+            sdpmodel = True
+
+        if sdpmodel:
+            W = cp.Variable((N, N), symmetric=True)
+            M1 = cp.vstack([W, w.T])
+            if obj == "Sharpe":
+                M2 = cp.vstack([w, k])
+            else:
+                M2 = cp.vstack([w, np.ones((1, 1))])
+            M3 = cp.hstack([M1, M2])
+            sdpconstraints = [M3 >> 0]
+            penalty_factor = self.graph_penalty * cp.trace(W)
+
+        # OWA Model Variables
+
+        a = cp.Variable((T, 1))
+        b = cp.Variable((T, 1))
+        y = cp.Variable((T, 1))
+        risk = cp.sum(a + b)
+
+        constraints = []
+        constraints += [returns @ w == y]
+        if owa_w is None:
+            owa_w = owa.owa_gmd(T)
+
+        onesvec = np.ones((T, 1))
+        constraints += [y @ owa_w.T <= onesvec @ a.T + b @ onesvec.T]
+
+        # Boolean Variables
+
+        flag_int = False
+        if (
+            self.card is not None
+            or self.network_ip is not None
+            or self.cluster_ip is not None
+            or (
+                self.aintinequality is not None
+                and self.bintinequality is not None
+                and self.cintinequality is not None
+                and self.dintinequality is not None
+                and self.eintinequality is not None
+                and self.fintinequality is not None
+            )
+        ):
+            flag_int = True
+            if obj == "Sharpe":
+                e = cp.Variable((mu.shape[1], 1), boolean=True)
+                e1 = cp.Variable((mu.shape[1], 1))
+            else:
+                e = cp.Variable((mu.shape[1], 1), boolean=True)
+
+        # Problem Weight Constraints
+
+        if obj == "Sharpe":
+            constraints += [cp.sum(w) == self.budget * k, k * 1000 >= 0]
+            if self.sht == False:
+                constraints += [w * 1000 >= 0]
+                if flag_int:
+                    constraints += [
+                        e1 <= k,
+                        e1 >= 0,
+                        e1 <= 100000 * e,
+                        e1 >= k - 100000 * (1 - e),
+                        w <= self.upperlng * e1,
+                        w >= self.lowerlng * e1,
+                    ]
+                else:
+                    constraints += [
+                        w <= self.upperlng * k,
+                        w >= self.lowerlng * k,
+                    ]
+            elif self.sht == True:
+                constraints += [
+                    cp.sum(cp.pos(w)) * 1000
+                    <= (self.budget + self.budgetsht) * k * 1000,
+                    cp.sum(cp.neg(w)) * 1000 <= self.budgetsht * k * 1000,
+                ]
+                if flag_int:
+                    constraints += [
+                        e1 <= k,
+                        e1 >= 0,
+                        e1 <= 100000 * e,
+                        e1 >= k - 100000 * (1 - e),
+                        w >= -min(self.uppersht, self.budgetsht) * e1,
+                        w <= min(self.upperlng, (self.budget + self.budgetsht)) * e1,
+                    ]
+                else:
+                    constraints += [
+                        w >= -min(self.uppersht, self.budgetsht) * k,
+                        w <= min(self.upperlng, (self.budget + self.budgetsht)) * k,
+                    ]
+        else:
+            constraints += [cp.sum(w) == self.budget]
+            if self.sht == False:
+                constraints += [w <= self.upperlng, w >= self.lowerlng, w * 1000 >= 0]
+                if flag_int:
+                    constraints += [
+                        w <= self.upperlng * e,
+                        w >= self.lowerlng * e,
+                    ]
+                else:
+                    constraints += [
+                        w <= self.upperlng,
+                        w >= self.lowerlng,
+                    ]
+            elif self.sht == True:
+                constraints += [
+                    cp.sum(cp.pos(w)) * 1000 <= (self.budget + self.budgetsht) * 1000,
+                    cp.sum(cp.neg(w)) * 1000 <= self.budgetsht * 1000,
+                ]
+                if flag_int:
+                    constraints += [
+                        w >= -min(self.uppersht, self.budgetsht) * e,
+                        w <= min(self.upperlng, (self.budget + self.budgetsht)) * e,
+                    ]
+                else:
+                    constraints += [
+                        w >= -min(self.uppersht, self.budgetsht),
+                        w <= min(self.upperlng, (self.budget + self.budgetsht)),
+                    ]
+
+        if flag_int:
+
+            # Cardinality Constraint
+
+            if self.card is not None:
+                constraints += [
+                    cp.sum(e) <= self.card,
+                ]
+
+            # Integer Constraint
+
+            if (
+                self.aintinequality is not None
+                and self.bintinequality is not None
+                and self.cintinequality is not None
+                and self.dintinequality is not None
+                and self.eintinequality is not None
+                and self.fintinequality is not None
+            ):
+                e_set = {}
+                for key in self.aintinequality.keys():
+                    if min(self.aintinequality[key].shape) > 0:
+                        constraints += [
+                            self.aintinequality[key] @ e <= self.bintinequality[key]
+                        ]
+                    if min(self.cintinequality[key].shape) > 0:
+                        e_set[key] = cp.Variable(
+                            (self.cintinequality[key].shape[0], 1), boolean=True
+                        )
+                        constraints += [
+                            self.cintinequality[key] @ e
+                            <= cp.multiply(self.dintinequality[key], e_set[key]),
+                            self.eintinequality[key] @ e_set[key]
+                            <= self.fintinequality[key],
+                        ]
+
+            # Network IP Constraint
+
+            if self.network_ip is not None:
+                constraints += [
+                    np.unique(self.network_ip + np.identity(N), axis=0) @ e <= 1
+                ]
+
+            # Cluster IP Constraint
+
+            if self.cluster_ip is not None:
+                constraints += [
+                    np.unique(self.cluster_ip + np.identity(N), axis=0) @ e <= 1
+                ]
+        else:
+
+            # Network SDP Constraint
+
+            if self.network_sdp is not None:
+                constraints += [cp.multiply(self.network_sdp, W) == 0]
+
+            # Cluster SDP Constraint
+
+            if self.cluster_sdp is not None:
+                constraints += [cp.multiply(self.cluster_sdp, W) == 0]
+
+        # Problem Linear Constraints
+
+        if self.ainequality is not None and self.binequality is not None:
+            A = np.array(self.ainequality, ndmin=2) * 1000
+            B = np.array(self.binequality, ndmin=2) * 1000
+            if obj == "Sharpe":
+                constraints += [A @ w - B @ k <= 0]
+            else:
+                constraints += [A @ w - B <= 0]
+
+        # Number of Effective Assets Constraints
+
+        if self.nea is not None:
+            if obj == "Sharpe":
+                constraints += [cp.norm(w, "fro") <= 1 / self.nea**0.5 * k]
+            else:
+                constraints += [cp.norm(w, "fro") <= 1 / self.nea**0.5]
+
+        # Tracking Error Model Variables
+
+        c = np.array(self.benchweights, ndmin=2)
+        if self.kindbench == True:
+            bench = returns @ c
+        elif self.kindbench == False:
+            bench = np.array(self.benchindex, ndmin=2)
+
+        # Tracking error Constraints
+
+        if obj == "Sharpe":
+            if self.allowTE == True:
+                TE_1 = cp.norm(returns @ w - bench @ k, "fro") / cp.sqrt(T - 1)
+                constraints += [TE_1 * 1000 <= self.TE * k * 1000]
+        else:
+            if self.allowTE == True:
+                TE_1 = cp.norm(returns @ w - bench, "fro") / cp.sqrt(T - 1)
+                constraints += [TE_1 * 1000 <= self.TE * 1000]
+
+        # Turnover Constraints
+
+        if obj == "Sharpe":
+            if self.allowTO == True:
+                TO_1 = cp.abs(w - c @ k) * 1000
+                constraints += [TO_1 <= self.turnover * k * 1000]
+        else:
+            if self.allowTO == True:
+                TO_1 = cp.abs(w - c) * 1000
+                constraints += [TO_1 <= self.turnover * 1000]
+
+        # Problem return Constraints
+
+        if self.lowerret is not None:
+            if obj == "Sharpe":
+                constraints += [ret >= self.lowerret * k]
+            else:
+                constraints += [ret >= self.lowerret]
+
+        # Problem centrality measures constraints
+
+        if self.acentrality is not None and self.bcentrality is not None:
+            if obj == "Sharpe":
+                constraints += [self.acentrality @ w == self.bcentrality * k]
+            else:
+                constraints += [self.acentrality @ w == self.bcentrality]
+
+        # SDP constraints
+
+        if sdpmodel == True:
+            constraints += sdpconstraints
+
         # Frontier Variables
 
         portafolio = {}
@@ -3167,23 +5793,31 @@ class Portfolio(object):
         if obj == "Sharpe":
             if kelly == "exact":
                 constraints += [risk <= 1]
-                constraints += [
-                    cp.constraints.ExpCone(gr, np.ones((T, 1)) @ k, k + returns @ w)
-                ]
-                objective = cp.Maximize(ret * 1000)
+                constraints += [cp.ExpCone(gr, onesvec @ k, k + returns @ w)]
+                objective = cp.Maximize(
+                    ret * 1000 - rf0 * k * 1000 - penalty_factor * 1000
+                )
             elif kelly == "approx":
                 constraints += [risk <= 1]
                 constraints += devconstraints
-                objective = cp.Maximize(ret)
-            elif kelly == False:
-                constraints += [mu @ w - rf0 * k == 1]
-                objective = cp.Minimize(risk * 1000)
+                objective = cp.Maximize(
+                    ret * 1000 - rf0 * k * 1000 - penalty_factor * 1000
+                )
+            elif kelly is None:
+                if (mu < 0).all():
+                    constraints += [risk <= 1]
+                    objective = cp.Maximize(
+                        ret * 1000 - rf0 * k * 1000 - penalty_factor * 1000
+                    )
+                else:
+                    constraints += [ret - rf0 * k == 1]
+                    objective = cp.Minimize(risk * 1000 + penalty_factor * 1000)
         elif obj == "MinRisk":
-            objective = cp.Minimize(risk * 1000)
+            objective = cp.Minimize(risk + penalty_factor)
         elif obj == "Utility":
-            objective = cp.Maximize(ret - l * risk)
+            objective = cp.Maximize(ret - l * risk - penalty_factor)
         elif obj == "MaxRet":
-            objective = cp.Maximize(ret * 1000)
+            objective = cp.Maximize(ret * 1000 - penalty_factor * 1000)
 
         try:
             prob = cp.Problem(objective, constraints)
@@ -3222,46 +5856,367 @@ class Portfolio(object):
 
         return self.owa_optimal
 
-    def frontier_limits(self, model="Classic", rm="MV", kelly=False, rf=0, hist=True):
+    def mvsk_optimization(
+        self, model="Classic", obj="Sharpe", rf=0, l=[2, 3, 4], solvers=["SCS"]
+    ):
+        r"""
+        This method that calculates the MVSK portfolio using a semidefinite
+        relaxation of higher moments. The general problem that solves is:
+
+        .. math::
+            \begin{align}
+            \underset{w}{\text{optimize}} & \quad F(w)\\
+            \text{s. t.} & \quad Aw \leq b\\
+            \end{align}
+
+        Where:
+
+        :math:`F(w)` is a function based on the first fourth portfolio moments.
+
+        :math:`Aw \leq b` is a set of linear constraints on asset weights.
+
+        Parameters
+        ----------
+        model : str can be {'Classic', 'FM', 'EP'}
+            The model used for optimize the portfolio.
+            The default is 'Classic'. Possible values are:
+
+            - 'Classic': use estimates of expected return vector and covariance matrix that depends on historical data.
+            - 'FM': use estimates of expected return vector, covariance matrix and cokurtosis square matrix based on a Risk Factor model specified by the user.
+            - 'EP': use estimates of expected return vector, covariance matrix and cokurtosis square matrix based on Entropy Pooling model.
+
+        obj : str can be {'MinRisk', 'Utility', 'Sharpe' or 'MaxRet'}.
+            Objective function of the optimization model.
+            The default is 'Sharpe'. Possible values are:
+
+            - 'MinRisk': Minimize the risk function based on portfolio variance, skewness and kurtosis.
+            - 'Utility': Maximize the Utility function based on the first fourth portfolio moments.
+            - 'Sharpe': Maximize the risk adjusted return ratio based on portfolio variance, skewness and kurtosis.
+            - 'MaxRet': Maximize the expected return of the portfolio.
+
+        rf : float, optional
+            Risk free rate, must be in the same period of assets returns.
+            The default is 0.
+        l : list, optional
+            List with the risk aversion factors of the portfolio variance,
+            skewness and kurtosis. The default is '[2, 3, 4]'.
+        solvers : list, optional
+            List of solvers used to solve the MVSK problem. It is recommended to use
+            solvers that supports first-order algorithms such as 'SCS' because
+            the problem is hard and it consumes a lot of resources. The default
+            value is'SCS'.
+
+        Returns
+        -------
+        mvsk_optimal : DataFrame
+            The weights of optimal MVSK portfolio.
+
+        """
+
+        # General model Variables
+
+        mu = None
+        sigma = None
+        skew = None
+        kurt = None
+        returns = None
+        if model == "Classic":
+            mu = np.array(self.mu, ndmin=2)
+            sigma = np.array(self.cov, ndmin=2)
+            skew = np.array(self.skew, ndmin=2)
+            kurt = np.array(self.kurt, ndmin=2)
+            returns = np.array(self.returns, ndmin=2)
+        elif model == "FM":
+            mu = np.array(self.mu_fm, ndmin=2)
+            sigma = np.array(self.cov_fm, ndmin=2)
+            skew = np.array(self.skew_fm, ndmin=2)
+            kurt = np.array(self.kurt_fm, ndmin=2)
+            returns = np.array(self.returns_fm, ndmin=2)
+        elif model == "EP":
+            mu = np.array(self.mu_ep, ndmin=2)
+            sigma = np.array(self.cov_ep, ndmin=2)
+            skew = np.array(self.skew_ep, ndmin=2)
+            kurt = np.array(self.kurt_ep, ndmin=2)
+            returns = np.array(self.returns, ndmin=2)
+
+        if skew is None or kurt is None:
+            raise ValueError("You need to estimate cokurtosis matrix")
+
+        self.solvers = solvers
+
+        w = cp.Variable((mu.shape[1], 1))
+        k = cp.Variable((1, 1))
+        rf0 = rf
+        T, N = returns.shape
+        rows = int(N * (N + 1) / 2)
+
+        L2 = self.L_2
+        D2 = self.D_2
+        S2 = self.S_2
+        S_kurt = S2 @ kurt @ S2.T
+
+        # Return Variables
+
+        ret = mu @ w
+
+        # MVSK Model Variables
+
+        W2 = cp.Variable((N, N), symmetric=True)  # represents x @ x.T
+        W3 = cp.Variable((rows, N))  # represents z @ x.T
+        W4 = cp.Variable((rows, rows), symmetric=True)  # represents z @ z.T
+        vec_W2 = L2 @ cp.reshape(cp.vec(W2, order="F"), (N**2, 1), order="F")
+        if obj == "Sharpe":
+            M = cp.bmat([[k, w.T, vec_W2.T], [w, W2, W3.T], [vec_W2, W3, W4]])
+        else:
+            M = cp.bmat([[np.eye(1), w.T, vec_W2.T], [w, W2, W3.T], [vec_W2, W3, W4]])
+        constraints = []
+        constraints += [M >> 0]
+
+        variance = cp.trace(sigma @ W2)
+        skewness = cp.trace(skew @ D2 @ W3)
+        kurtosis = cp.trace(S_kurt @ W4)
+        risk = l[0] * variance - l[1] * skewness + l[2] * kurtosis
+
+        # Problem Weight Constraints
+
+        if obj == "Sharpe":
+            constraints += [cp.sum(w) == self.budget * k, k * 1000 >= 0]
+            if self.sht == False:
+                constraints += [
+                    w * 1000 >= 0,
+                    w <= self.upperlng * k,
+                    w >= self.lowerlng * k,
+                ]
+            elif self.sht == True:
+                constraints += [
+                    cp.sum(cp.pos(w)) * 1000
+                    <= (self.budget + self.budgetsht) * k * 1000,
+                    cp.sum(cp.neg(w)) * 1000 <= self.budgetsht * k * 1000,
+                    w >= -min(self.uppersht, self.budgetsht) * k,
+                    w <= min(self.upperlng, (self.budget + self.budgetsht)) * k,
+                ]
+        else:
+            constraints += [cp.sum(w) == self.budget]
+            if self.sht == False:
+                constraints += [
+                    w * 1000 >= 0,
+                    w <= self.upperlng,
+                    w >= self.lowerlng,
+                ]
+            elif self.sht == True:
+                constraints += [
+                    cp.sum(cp.pos(w)) * 1000 <= (self.budget + self.budgetsht) * 1000,
+                    cp.sum(cp.neg(w)) * 1000 <= self.budgetsht * 1000,
+                    w >= -min(self.uppersht, self.budgetsht),
+                    w <= min(self.upperlng, (self.budget + self.budgetsht)),
+                ]
+
+            # Network SDP Constraint
+
+            if self.network_sdp is not None:
+                constraints += [cp.multiply(self.network_sdp, W2) == 0]
+
+            # Cluster SDP Constraint
+
+            if self.cluster_sdp is not None:
+                constraints += [cp.multiply(self.cluster_sdp, W2) == 0]
+
+        # Problem Linear Constraints
+
+        if self.ainequality is not None and self.binequality is not None:
+            A = np.array(self.ainequality, ndmin=2) * 1000
+            B = np.array(self.binequality, ndmin=2) * 1000
+            if obj == "Sharpe":
+                constraints += [A @ w - B @ k <= 0]
+            else:
+                constraints += [A @ w - B <= 0]
+
+        # Number of Effective Assets Constraints
+
+        if self.nea is not None:
+            if obj == "Sharpe":
+                constraints += [cp.norm(w, "fro") <= 1 / self.nea**0.5 * k]
+            else:
+                constraints += [cp.norm(w, "fro") <= 1 / self.nea**0.5]
+
+        # Tracking Error Model Variables
+
+        c = np.array(self.benchweights, ndmin=2)
+        if self.kindbench == True:
+            bench = returns @ c
+        elif self.kindbench == False:
+            bench = np.array(self.benchindex, ndmin=2)
+
+        # Tracking error Constraints
+
+        if obj == "Sharpe":
+            if self.allowTE == True:
+                TE_1 = cp.norm(returns @ w - bench @ k, "fro") / cp.sqrt(T - 1)
+                constraints += [TE_1 * 1000 <= self.TE * k * 1000]
+        else:
+            if self.allowTE == True:
+                TE_1 = cp.norm(returns @ w - bench, "fro") / cp.sqrt(T - 1)
+                constraints += [TE_1 * 1000 <= self.TE * 1000]
+
+        # Turnover Constraints
+
+        if obj == "Sharpe":
+            if self.allowTO == True:
+                TO_1 = cp.abs(w - c @ k) * 1000
+                constraints += [TO_1 <= self.turnover * k * 1000]
+        else:
+            if self.allowTO == True:
+                TO_1 = cp.abs(w - c) * 1000
+                constraints += [TO_1 <= self.turnover * 1000]
+
+        # Moments Constraints
+
+        if self.lowerret is not None:
+            if obj == "Sharpe":
+                constraints += [ret >= self.lowerret * k]
+            else:
+                constraints += [ret >= self.lowerret]
+
+        if self.upperdev is not None:
+            if obj == "Sharpe":
+                constraints += [variance * 1000 <= self.upperdev**2 * k * 1000]
+            else:
+                constraints += [variance * 1000 <= self.upperdev**2 * 1000]
+
+        if self.lowerskew is not None:
+            if obj == "Sharpe":
+                constraints += [skewness * 1000 >= self.lowerskew * k * 1000]
+            else:
+                constraints += [skewness * 1000 >= self.lowerskew * 1000]
+
+        if self.upperkt is not None:
+            if obj == "Sharpe":
+                constraints += [kurtosis * 1000 <= self.upperkt**2 * k * 1000]
+            else:
+                constraints += [kurtosis * 1000 <= self.upperkt**2 * 1000]
+
+        # Problem centrality measures constraints
+
+        if self.acentrality is not None and self.bcentrality is not None:
+            if obj == "Sharpe":
+                constraints += [self.acentrality @ w == self.bcentrality * k]
+            else:
+                constraints += [self.acentrality @ w == self.bcentrality]
+
+        # Frontier Variables
+
+        portafolio = {}
+
+        for i in self.assetslist:
+            portafolio.update({i: []})
+
+        # Optimization Process
+
+        # Defining objective function
+        if obj == "Sharpe":
+            if (mu < 0).all():
+                constraints += [risk <= 1]
+                objective = cp.Maximize(ret * 1000 - rf0 * k * 1000)
+            else:
+                constraints += [ret - rf0 * k == 1]
+                objective = cp.Minimize(risk * 1000)
+        elif obj == "MinRisk":
+            objective = cp.Minimize(risk)
+        elif obj == "Utility":
+            objective = cp.Maximize(ret - risk)
+        elif obj == "MaxRet":
+            objective = cp.Maximize(ret * 1000)
+
+        try:
+            prob = cp.Problem(objective, constraints)
+            for solver in self.solvers:
+                try:
+                    if len(self.sol_params) == 0:
+                        prob.solve(solver=solver)
+                    else:
+                        prob.solve(solver=solver, **self.sol_params[solver])
+                except:
+                    pass
+                if w.value is not None:
+                    break
+
+            if obj == "Sharpe":
+                weights = np.array(w.value / k.value, ndmin=2).T
+            else:
+                weights = np.array(w.value, ndmin=2).T
+
+            if self.sht == False:
+                weights = np.abs(weights) / np.sum(np.abs(weights)) * self.budget
+
+            for j in self.assetslist:
+                portafolio[j].append(weights[0, self.assetslist.index(j)])
+
+        except:
+            pass
+
+        try:
+            self.mvsk_optimal = pd.DataFrame(
+                portafolio, index=["weights"], dtype=np.float64
+            ).T
+        except:
+            self.mvsk_optimal = None
+            print("The problem doesn't have a solution with actual input parameters")
+
+        return self.mvsk_optimal
+
+    def frontier_limits(self, model="Classic", rm="MV", kelly=None, rf=0, hist=True):
         r"""
         Method that calculates the minimum risk and maximum return portfolios
         available with current assets and constraints.
 
         Parameters
         ----------
-        model : str, optional
-            Methodology used to estimate input parameters.
-            The default is 'Classic'.
+        model : str can be {'Classic', 'BL', 'FM', 'BLFM', 'EP'}
+            The model used for optimize the portfolio.
+            The default is 'Classic'. Possible values are:
+
+            - 'Classic': use estimates of expected return vector and covariance matrix that depends on historical data.
+            - 'BL': use estimates of expected return vector and covariance matrix based on the Black Litterman model.
+            - 'FM': use estimates of expected return vector, covariance matrix and cokurtosis square matrix based on a Risk Factor model specified by the user.
+            - 'BLFM': use estimates of expected return vector and covariance matrix based on Black Litterman applied to a Risk Factor model specified by the user.
+            - 'EP': use estimates of expected return vector, covariance matrix and cokurtosis square matrix based on Entropy Pooling model.
+
         rm : str, optional
             The risk measure used to optimize the portfolio.
             The default is 'MV'. Possible values are:
 
             - 'MV': Standard Deviation.
             - 'KT': Square Root of Kurtosis.
+            - 'EM': p_em Root of Even Moment of order 2 * p_em.
             - 'MAD': Mean Absolute Deviation.
             - 'GMD': Gini Mean Difference.
             - 'MSV': Semi Standard Deviation.
             - 'SKT': Square Root of Semi Kurtosis.
+            - 'ESM': p_esm Root of Even Semi Moment of order 2 * p_esm.
             - 'FLPM': First Lower Partial Moment (Omega Ratio).
             - 'SLPM': Second Lower Partial Moment (Sortino Ratio).
             - 'CVaR': Conditional Value at Risk.
             - 'TG': Tail Gini.
             - 'EVaR': Entropic Value at Risk.
+            - 'RLVaR': Relativistic Value at Risk.
             - 'WR': Worst Realization (Minimax).
             - 'RG': Range of returns.
             - 'CVRG': CVaR range of returns.
             - 'TGRG': Tail Gini range of returns.
+            - 'EVRG': EVaR range of returns.
+            - 'RVRG': RLVaR range of returns. I recommend only use this function with MOSEK solver.
             - 'MDD': Maximum Drawdown of uncompounded cumulative returns (Calmar Ratio).
             - 'ADD': Average Drawdown of uncompounded cumulative returns.
             - 'CDaR': Conditional Drawdown at Risk of uncompounded cumulative returns.
             - 'EDaR': Entropic Drawdown at Risk of uncompounded cumulative returns.
+            - 'RLDaR': Relativistic Drawdown at Risk of uncompounded cumulative returns. I recommend only use this function with MOSEK solver.
             - 'UCI': Ulcer Index of uncompounded cumulative returns.
 
         kelly : str, optional
-            Method used to calculate mean return. Possible values are False for
+            Method used to calculate mean return. Possible values are: None for
             arithmetic mean return, "approx" for approximate mean logarithmic
             return using first and second moment and "exact" for mean logarithmic
-            return. The default is False.
+            return. The default is None.
         rf : scalar, optional
             Risk free rate. The default is 0.
         hist : bool, optional
@@ -3303,7 +6258,14 @@ class Portfolio(object):
             raise NameError("The limits of the frontier can't be found")
 
     def efficient_frontier(
-        self, model="Classic", rm="MV", kelly=False, points=20, rf=0, hist=True
+        self,
+        model="Classic",
+        rm="MV",
+        kelly=None,
+        points=20,
+        rf=0,
+        solver="CLARABEL",
+        hist=True,
     ):
         r"""
         Method that calculates several portfolios in the efficient frontier
@@ -3312,44 +6274,60 @@ class Portfolio(object):
 
         Parameters
         ----------
-        model : str, optional
-            Methodology used to estimate input parameters.
-            The default is 'Classic'.
+        model : str can be {'Classic', 'BL', 'FM', 'BLFM', 'EP'}
+            The model used for optimize the portfolio.
+            The default is 'Classic'. Possible values are:
+
+            - 'Classic': use estimates of expected return vector and covariance matrix that depends on historical data.
+            - 'BL': use estimates of expected return vector and covariance matrix based on the Black Litterman model.
+            - 'FM': use estimates of expected return vector, covariance matrix and cokurtosis square matrix based on a Risk Factor model specified by the user.
+            - 'BLFM': use estimates of expected return vector and covariance matrix based on Black Litterman applied to a Risk Factor model specified by the user.
+            - 'EP': use estimates of expected return vector, covariance matrix and cokurtosis square matrix based on Entropy Pooling model.
+
         rm : str, optional
             The risk measure used to optimize the portfolio.
             The default is 'MV'. Possible values are:
 
             - 'MV': Standard Deviation.
             - 'KT': Square Root of Kurtosis.
+            - 'EM': p_em Root of Even Moment of order 2 * p_em.
             - 'MAD': Mean Absolute Deviation.
             - 'GMD': Gini Mean Difference.
             - 'MSV': Semi Standard Deviation.
             - 'SKT': Square Root of Semi Kurtosis.
+            - 'ESM': p_esm Root of Even Semi Moment of order 2 * p_esm.
             - 'FLPM': First Lower Partial Moment (Omega Ratio).
             - 'SLPM': Second Lower Partial Moment (Sortino Ratio).
             - 'CVaR': Conditional Value at Risk.
             - 'TG': Tail Gini.
             - 'EVaR': Entropic Value at Risk.
+            - 'RLVaR': Relativistic Value at Risk.
             - 'WR': Worst Realization (Minimax).
             - 'RG': Range of returns.
             - 'CVRG': CVaR range of returns.
             - 'TGRG': Tail Gini range of returns.
+            - 'EVRG': EVaR range of returns.
+            - 'RVRG': RLVaR range of returns. I recommend only use this function with MOSEK solver.
             - 'MDD': Maximum Drawdown of uncompounded cumulative returns (Calmar Ratio).
             - 'ADD': Average Drawdown of uncompounded cumulative returns.
             - 'CDaR': Conditional Drawdown at Risk of uncompounded cumulative returns.
             - 'EDaR': Entropic Drawdown at Risk of uncompounded cumulative returns.
+            - 'RLDaR': Relativistic Drawdown at Risk of uncompounded cumulative returns. I recommend only use this function with MOSEK solver.
             - 'UCI': Ulcer Index of uncompounded cumulative returns.
 
         kelly : str, optional
-            Method used to calculate mean return. Possible values are False for
+            Method used to calculate mean return. Possible values are: None for
             arithmetic mean return, "approx" for approximate mean logarithmic
             return using first and second moment and "exact" for mean logarithmic
-            return. The default is False.
+            return. The default is None.
         points : scalar, optional
             Number of point calculated from the efficient frontier.
             The default is 50.
         rf : scalar, optional
             Risk free rate. The default is 0.
+        solver : str, optional
+            Solver available for CVXPY that supports power cone programming.
+            Used to calculate RLVaR and RLDaR. The default value is 'CLARABEL'.
         hist : bool, optional
             Indicate what kind of returns are used to calculate risk measures
             that depends on scenarios (All except 'MV' risk measure).
@@ -3408,6 +6386,13 @@ class Portfolio(object):
             elif hist == 2:
                 sigma = np.array(self.cov_fm, ndmin=2)
                 returns = np.array(self.returns_fm, ndmin=2)
+        elif model == "EP":
+            mu = np.array(self.mu_ep, ndmin=2)
+            if hist == False:
+                sigma = np.array(self.cov_ep, ndmin=2)
+            elif hist == True:
+                sigma = np.array(self.cov, ndmin=2)
+            returns = np.array(self.returns, ndmin=2)
 
         alpha = self.alpha
         a_sim = self.a_sim
@@ -3421,6 +6406,16 @@ class Portfolio(object):
             b_sim = a_sim
         else:
             b_sim = self.b_sim
+
+        kappa = self.kappa
+
+        if self.kappa_g is None:
+            kappa_g = kappa
+        else:
+            kappa_g = self.kappa_g
+
+        p_em = self.p_em
+        p_esm = self.p_esm
 
         limits = self.frontier_limits(model=model, rm=rm, kelly=kelly, rf=rf, hist=hist)
 
@@ -3490,54 +6485,84 @@ class Portfolio(object):
         elif rm == "TGRG":
             risk_min = rk.TGRG(returns @ w_min, alpha, a_sim, beta, b_sim)
             risk_max = rk.TGRG(returns @ w_max, alpha, a_sim, beta, b_sim)
+        elif rm == "RLVaR":
+            risk_min = rk.RLVaR_Hist(returns @ w_min, alpha, kappa, solver)
+            risk_max = rk.RLVaR_Hist(returns @ w_max, alpha, kappa, solver)
+        elif rm == "RLDaR":
+            risk_min = rk.RLDaR_Abs(returns @ w_min, alpha, kappa, solver)
+            risk_max = rk.RLDaR_Abs(returns @ w_max, alpha, kappa, solver)
+        elif rm == "EVRG":
+            risk_min = rk.EVRG(returns @ w_min, alpha, beta, solver)
+            risk_max = rk.EVRG(returns @ w_max, alpha, beta, solver)
+        elif rm == "RVRG":
+            risk_min = rk.RVRG(returns @ w_min, alpha, beta, kappa, kappa_g, solver)
+            risk_max = rk.RVRG(returns @ w_max, alpha, beta, kappa, kappa_g, solver)
+        elif rm == "EM":
+            risk_min = rk.EvenMoment(returns @ w_min, p_em)
+            risk_max = rk.EvenMoment(returns @ w_max, p_em)
+        elif rm == "ESM":
+            risk_min = rk.EvenSemiMoment(returns @ w_min, p_esm)
+            risk_max = rk.EvenSemiMoment(returns @ w_max, p_esm)
 
-        mus = np.linspace(ret_min, ret_max, points)
+        mus = np.linspace(ret_min, ret_max, int(points))
 
-        risks = np.linspace(risk_min, risk_max, points)
+        risks = np.linspace(risk_min, risk_max, int(points))
 
         risk_lims = [
             "upperdev",
             "upperkt",
+            "upperem",
             "uppermad",
             "uppergmd",
             "uppersdev",
             "upperskt",
+            "upperesm",
             "upperCVaR",
             "uppertg",
             "upperEVaR",
+            "upperRLVaR",
             "upperwr",
             "upperrg",
             "uppercvrg",
             "uppertgrg",
+            "upperevrg",
+            "upperrvrg",
             "upperflpm",
             "upperslpm",
             "uppermdd",
             "upperadd",
             "upperCDaR",
             "upperEDaR",
+            "upperRLDaR",
             "upperuci",
         ]
 
         risk_names = [
             "MV",
             "KT",
+            "EM",
             "MAD",
             "GMD",
             "MSV",
             "SKT",
+            "ESM",
             "CVaR",
             "TG",
             "EVaR",
+            "RLVaR",
             "WR",
             "RG",
             "CVRG",
             "TGRG",
+            "EVRG",
+            "RVRG",
             "FLPM",
             "SLPM",
             "MDD",
             "ADD",
             "CDaR",
             "EDaR",
+            "RLDaR",
             "UCI",
         ]
 
@@ -3583,30 +6608,35 @@ class Portfolio(object):
     def reset_risk_constraints(self):
         r"""
         Reset all risk constraints.
-
         """
         cons = [
             "lowerret",
             "upperdev",
             "upperkt",
             "uppermad",
+            "uppergmd",
             "uppersdev",
             "upperskt",
             "upperCVaR",
+            "uppertg",
             "upperEVaR",
+            "upperRLVaR",
             "upperwr",
+            "upperrg",
+            "uppercvrg",
+            "uppertgrg",
+            "upperevrg",
+            "upperrvrg",
             "upperflpm",
             "upperslpm",
             "uppermdd",
             "upperadd",
             "upperCDaR",
             "upperEDaR",
+            "upperRLDaR",
             "upperuci",
-            "uppergmd",
-            "uppertg",
-            "upperrg",
-            "uppercvrg",
-            "uppertgrg",
+            "upperem",
+            "upperesm",
         ]
 
         for i in cons:
@@ -3620,6 +6650,22 @@ class Portfolio(object):
 
         self.ainequality = None
         self.binequality = None
+        self.arcinequality = (None,)
+        self.brcinequality = (None,)
+        self.afrcinequality = (None,)
+        self.bfrcinequality = (None,)
+        self.aintinequality = (None,)
+        self.bintinequality = (None,)
+        self.cintinequality = (None,)
+        self.dintinequality = (None,)
+        self.eintinequality = (None,)
+        self.fintinequality = (None,)
+        self.b = None
+        self.network_sdp = None
+        self.graph_penalty = 0.05
+        self.network_ip = None
+        self.acentrality = None
+        self.bcentrality = None
 
     def reset_inputs(self):
         r"""
@@ -3641,6 +6687,10 @@ class Portfolio(object):
             "mu_bl_fm",
             "cov_bl_fm",
             "returns_fm",
+            "mu_ep",
+            "cov_ep",
+            "skew_ep",
+            "kurt_ep",
             "cov_l",
             "cov_u",
             "cov_mu",
@@ -3648,6 +6698,10 @@ class Portfolio(object):
             "d_mu",
             "k_mu",
             "k_sigma",
+            "z_EVaR",
+            "z_EDaR",
+            "z_RLVaR",
+            "z_RLDaR",
         ]
 
         for i in cons:
@@ -3663,14 +6717,21 @@ class Portfolio(object):
         self.uppersht = 0.2
         self.upperlng = 1
         self.budget = 1
+        self.budgetsh = 0.2
         self.nea = None
         self.card = None
         self._factors = None
         self.B = None
         self.alpha = 0.05
+        self.a_sim = 100
+        self.beta = None
+        self.b_sim = None
+        self.kappa = 0.30
+        self.kappa_g = None
+        self.n_max_kurt = 50
         self.kindbench = True
         self.benchindex = None
-        self._benchweights = None
+        self.benchweights = None
         self.allowTO = False
         self.turnover = 0.05
         self.allowTE = False

@@ -1,5 +1,7 @@
 """"""  #
+
 """
+Copyright (c) 2020-2026, Dany Cajas
 This code is mainly based on Yinsen Miao's work available in:
 https://github.com/yinsenm/gerber/blob/af04c2ee5adf342393b028b85ab5546f31c0c8d3/src/gerber.py
 """
@@ -7,7 +9,6 @@ https://github.com/yinsenm/gerber/blob/af04c2ee5adf342393b028b85ab5546f31c0c8d3/
 import numpy as np
 import pandas as pd
 import riskfolio.src.AuxFunctions as af
-
 
 __all__ = [
     "gerber_cov_stat0",
@@ -19,17 +20,18 @@ __all__ = [
 def gerber_cov_stat0(X, threshold=0.5):
     r"""
     Compute Gerber covariance Statistics 0 or original Gerber statistics
-    :cite: `d-Gerber2021`, not always PSD, however this function fixes the
+    :cite:`d-Gerber2021`, not always PSD, however this function fixes the
     covariance matrix finding the nearest covariance matrix that is positive
     semidefinite.
 
     Parameters
     ----------
-    X : ndarray
-        Returns series of shape n_sample x n_features.
+    X : DataFrame of shape (n_samples, n_assets), optional
+        Assets returns DataFrame, where n_samples is the number of
+        observations and n_assets is the number of assets.
 
     threshold : float
-        threshold: threshold is between 0 and 1
+        Threshold is between 0 and 1.
 
     Returns
     -------
@@ -96,15 +98,16 @@ def gerber_cov_stat0(X, threshold=0.5):
 
 def gerber_cov_stat1(X, threshold=0.5):
     r"""
-    Compute Gerber covariance Statistics 1 :cite: `d-Gerber2021`.
+    Compute Gerber covariance Statistics 1 :cite:`d-Gerber2021`.
 
     Parameters
     ----------
-    X : ndarray
-        Returns series of shape n_sample x n_features.
+    X : DataFrame of shape (n_samples, n_assets), optional
+        Assets returns DataFrame, where n_samples is the number of
+        observations and n_assets is the number of assets.
 
     threshold : float
-        threshold: threshold is between 0 and 1
+        Threshold is between 0 and 1.
 
     Returns
     -------
@@ -174,15 +177,16 @@ def gerber_cov_stat1(X, threshold=0.5):
 
 def gerber_cov_stat2(X, threshold=0.5):
     r"""
-    Compute Gerber covariance Statistics 2 :cite: `d-Gerber2021`.
+    Compute Gerber covariance Statistics 2 :cite:`d-Gerber2021`.
 
     Parameters
     ----------
-    X : ndarray
-        Returns series of shape n_sample x n_features.
+    X : : DataFrame of shape (n_samples, n_assets), optional
+        Assets returns DataFrame, where n_samples is the number of
+        observations and n_assets is the number of assets.
 
     threshold : float
-        threshold: threshold is between 0 and 1
+        Threshold is between 0 and 1.
 
     Returns
     -------

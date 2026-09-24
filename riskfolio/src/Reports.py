@@ -1,6 +1,7 @@
 """"""  #
+
 """
-Copyright (c) 2020-2022, Dany Cajas
+Copyright (c) 2020-2026, Dany Cajas
 All rights reserved.
 This work is licensed under BSD 3-Clause "New" or "Revised" License.
 License available at https://github.com/dcajasn/Riskfolio-Lib/blob/master/LICENSE.txt
@@ -8,11 +9,11 @@ License available at https://github.com/dcajasn/Riskfolio-Lib/blob/master/LICENS
 
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
 from xlsxwriter.utility import xl_range_abs, xl_range, xl_rowcol_to_cell, xl_col_to_name
 import datetime
 import riskfolio.src.PlotFunctions as plf
 import riskfolio.src.RiskFunctions as rk
-
 
 __all__ = [
     "jupyter_report",
@@ -20,7 +21,7 @@ __all__ = [
 ]
 
 
-__LICENSE__ = """Copyright (c) 2020-2022, Dany Cajas 
+__LICENSE__ = """Copyright (c) 2020-2024, Dany Cajas
 All rights reserved.
 
 Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
@@ -37,8 +38,18 @@ def jupyter_report(
     rm="MV",
     rf=0,
     alpha=0.05,
+    a_sim=100,
+    beta=None,
+    b_sim=None,
+    kappa=0.30,
+    solver="CLARABEL",
+    percentage=False,
+    erc_line=True,
+    color="tab:blue",
+    erc_linecolor="r",
     others=0.05,
     nrow=25,
+    cmap="tab20",
     height=6,
     width=14,
     t_factor=252,
@@ -52,38 +63,75 @@ def jupyter_report(
 
     Parameters
     ----------
-    returns : DataFrame
-        Assets returns.
-    w : DataFrame of shape (n_assets, 1)
-        Portfolio weights.
+    returns : DataFrame of shape (n_samples, n_assets), optional
+        Assets returns DataFrame, where n_samples is the number of
+        observations and n_assets is the number of assets.
+    w : DataFrame or Series of shape (n_assets, 1)
+        Portfolio weights, where n_assets is the number of assets.
     rm : str, optional
         Risk measure used to estimate risk contribution.
         The default is 'MV'. Possible values are:
 
         - 'MV': Standard Deviation.
+        - 'KT': Square Root Kurtosis.
         - 'MAD': Mean Absolute Deviation.
+        - 'GMD': Gini Mean Difference.
         - 'MSV': Semi Standard Deviation.
+        - 'SKT': Square Root Semi Kurtosis.
         - 'FLPM': First Lower Partial Moment (Omega Ratio).
         - 'SLPM': Second Lower Partial Moment (Sortino Ratio).
         - 'CVaR': Conditional Value at Risk.
-        - 'EVaR': Conditional Value at Risk.
-        - 'WR': Worst Realization (Minimax)
+        - 'TG': Tail Gini.
+        - 'EVaR': Entropic Value at Risk.
+        - 'RLVaR': Relativistc Value at Risk.
+        - 'WR': Worst Realization (Minimax).
+        - 'CVRG': CVaR range of returns.
+        - 'TGRG': Tail Gini range of returns.
+        - 'RG': Range of returns.
         - 'MDD': Maximum Drawdown of uncompounded cumulative returns (Calmar Ratio).
         - 'ADD': Average Drawdown of uncompounded cumulative returns.
         - 'DaR': Drawdown at Risk of uncompounded cumulative returns.
         - 'CDaR': Conditional Drawdown at Risk of uncompounded cumulative returns.
         - 'EDaR': Entropic Drawdown at Risk of uncompounded cumulative returns.
+        - 'RLDaR': Relativistic Drawdown at Risk of uncompounded cumulative returns.
         - 'UCI': Ulcer Index of uncompounded cumulative returns.
 
     rf : float, optional
         Risk free rate or minimum acceptable return. The default is 0.
     alpha : float, optional
-        Significant level of VaR, CVaR, EVaR, DaR and CDaR.
+        Significance level of VaR, CVaR, Tail Gini, EVaR, RLVaR, CDaR, EDaR and RLDaR. The default is 0.05.
         The default is 0.05.
+    a_sim : float, optional
+        Number of CVaRs used to approximate Tail Gini of losses. The default is 100.
+    beta : float, optional
+        Significance level of CVaR and Tail Gini of gains. If None it duplicates alpha value.
+        The default is None.
+    b_sim : float, optional
+        Number of CVaRs used to approximate Tail Gini of gains. If None it duplicates a_sim value.
+        The default is None.
+    kappa : float, optional
+        Deformation parameter of RLVaR and RLDaR, must be between 0 and 1. The default is 0.30.
+    solver: str, optional
+        Solver available for CVXPY that supports power cone programming and exponential cone programming.
+        Used to calculate EVaR, EDaR, RLVaR and RLDaR. The default value is 'CLARABEL'.
+    percentage : bool, optional
+        If risk contribution per asset is expressed as percentage or as a value. The default is False.
+    erc_line : bool, optional
+        If equal risk contribution line is plotted.
+        The default is False.
+    color : str, optional
+        Color used to plot each asset risk contribution.
+        The default is 'tab:blue'.
+    erc_linecolor : str, optional
+        Color used to plot equal risk contribution line.
+        The default is 'r'.
     others : float, optional
         Percentage of others section. The default is 0.05.
     nrow : int, optional
         Number of rows of the legend. The default is 25.
+    cmap : cmap, optional
+        Color scale used to plot each asset weight.
+        The default is 'tab20'.
     height : float, optional
         Average height of charts in the image in inches. The default is 6.
     width : float, optional
@@ -91,9 +139,9 @@ def jupyter_report(
     t_factor : float, optional
         Factor used to annualize expected return and expected risks for
         risk measures based on returns (not drawdowns). The default is 252.
-        
+
         .. math::
-            
+
             \begin{align}
             \text{Annualized Return} & = \text{Return} \, \times \, \text{t_factor} \\
             \text{Annualized Risk} & = \text{Risk} \, \times \, \sqrt{\text{t_factor}}
@@ -110,8 +158,6 @@ def jupyter_report(
         Growth Rate (CAGR). Default value is 252 trading days per year.
     bins : float, optional
         Number of bins of the histogram. The default is 50.
-    ax : matplotlib axis of size (6,1), optional
-        If provided, plot on this axis. The default is None.
 
     Raises
     ------
@@ -120,66 +166,108 @@ def jupyter_report(
 
     Returns
     -------
-    ax : matplotlib axis
+    ax : matplotlib axis of size (6,1)
         Returns the Axes object with the plot for further tweaking.
 
     Example
     -------
     ::
 
-        ax = rp.jupyter_report(returns, w, rm='MV', rf=0, alpha=0.05, height=6, width=14,
-                               others=0.05, nrow=25)
+        ax = rp.jupyter_report(returns,
+                               w,
+                               rm='MV',
+                               rf=0,
+                               alpha=0.05,
+                               height=6,
+                               width=14,
+                               others=0.05,
+                               nrow=25)
 
-    .. image:: images/Report_1.png
-    .. image:: images/Report_2.png
-    .. image:: images/Report_3.png
-    .. image:: images/Report_4.png
+    .. image:: ../images/Report_1.png
+    .. image:: ../images/Report_2.png
+    .. image:: ../images/Report_3.png
+    .. image:: ../images/Report_4.png
 
     """
 
     cov = returns.cov()
-    nav = returns.cumsum()
 
-    fig, ax = plt.subplots(
-        nrows=6,
-        figsize=(width, height * 6),
-        gridspec_kw={"height_ratios": [2, 1, 1.5, 1, 1, 1]},
-    )
+    fig, ax = plt.subplots(figsize=(width, height * 6))
+    ax.axis("off")
 
-    ax[0] = plf.plot_table(
+    gs0 = GridSpec(5, 1, figure=fig, height_ratios=[2, 1.5, 1, 2, 1])
+    gs00 = gs0[0].subgridspec(1, 1)
+    ax0 = fig.add_subplot(gs00[0, 0])
+
+    gs01 = gs0[1].subgridspec(1, 1)
+    ax1 = fig.add_subplot(gs01[0, 0])
+
+    gs02 = gs0[2].subgridspec(1, 1)
+    ax2 = fig.add_subplot(gs02[0, 0])
+
+    gs03 = gs0[3].subgridspec(1, 1)
+    ax3 = fig.add_subplot(gs03[0, 0])
+
+    gs04 = gs0[4].subgridspec(1, 1)
+    ax4 = fig.add_subplot(gs04[0, 0])
+
+    ax0 = plf.plot_table(
         returns,
         w,
         MAR=rf,
         alpha=alpha,
+        a_sim=a_sim,
+        kappa=kappa,
+        solver=solver,
         t_factor=t_factor,
         ini_days=ini_days,
         days_per_year=days_per_year,
-        ax=ax[0],
+        ax=ax0,
     )
 
-    ax[2] = plf.plot_pie(
+    ax1 = plf.plot_pie(
         w=w,
         title="Portfolio Composition",
         others=others,
         nrow=nrow,
-        cmap="tab20",
-        ax=ax[2],
+        cmap=cmap,
+        ax=ax1,
     )
 
-    ax[3] = plf.plot_risk_con(
+    ax2 = plf.plot_hist(
+        returns=returns,
+        w=w,
+        alpha=alpha,
+        a_sim=a_sim,
+        kappa=kappa,
+        solver=solver,
+        bins=bins,
+        ax=ax2,
+    )
+
+    ax3 = plf.plot_drawdown(
+        returns=returns, w=w, alpha=alpha, kappa=kappa, solver=solver, ax=ax3
+    )
+
+    ax4 = plf.plot_risk_con(
         w=w,
         cov=cov,
         returns=returns,
         rm=rm,
         rf=rf,
         alpha=alpha,
+        a_sim=a_sim,
+        beta=beta,
+        b_sim=b_sim,
+        kappa=kappa,
+        solver=solver,
         t_factor=t_factor,
-        ax=ax[3],
+        percentage=percentage,
+        erc_line=erc_line,
+        color=color,
+        erc_linecolor=erc_linecolor,
+        ax=ax4,
     )
-
-    ax[4] = plf.plot_hist(returns=returns, w=w, alpha=alpha, bins=bins, ax=ax[4])
-
-    ax[[1, 5]] = plf.plot_drawdown(nav=nav, w=w, alpha=alpha, ax=ax[[1, 5]])
 
     year = str(datetime.datetime.now().year)
 
@@ -187,7 +275,7 @@ def jupyter_report(
     subtitle = "Copyright (c) 2020-" + year + ", Dany Cajas. All rights reserved."
 
     fig.suptitle(title, fontsize="xx-large", y=1.011, fontweight="bold")
-    ax[0].set_title(subtitle, fontsize="large", ha="center", pad=10)
+    ax0.set_title(subtitle, fontsize="large", ha="center", pad=10)
 
     return ax
 
@@ -197,6 +285,7 @@ def excel_report(
     w,
     rf=0,
     alpha=0.05,
+    solver="CLARABEL",
     t_factor=252,
     ini_days=1,
     days_per_year=252,
@@ -208,21 +297,25 @@ def excel_report(
 
     Parameters
     ----------
-    returns : DataFrame
-        Assets returns.
-    w : DataFrame of size (n_assets, n_portfolios)
-        Portfolio weights.
+    returns : DataFrame of shape (n_samples, n_assets), optional
+        Assets returns DataFrame, where n_samples is the number of
+        observations and n_assets is the number of assets.
+    w : DataFrame or Series of shape (n_assets, 1)
+        Portfolio weights, where n_assets is the number of assets.
     rf : float, optional
         Risk free rate or minimum acceptable return. The default is 0.
     alpha : float, optional
         Significance level of VaR, CVaR, EVaR, DaR and CDaR.
         The default is 0.05.
+    solver: str, optional
+        Solver available for CVXPY that supports exponential cone programming.
+        Used to calculate EVaR and EDaR. The default value is 'CLARABEL'.
     t_factor : float, optional
         Factor used to annualize expected return and expected risks for
         risk measures based on returns (not drawdowns). The default is 252.
-        
+
         .. math::
-            
+
             \begin{align}
             \text{Annualized Return} & = \text{Return} \, \times \, \text{t_factor} \\
             \text{Annualized Risk} & = \text{Risk} \, \times \, \sqrt{\text{t_factor}}
@@ -251,15 +344,23 @@ def excel_report(
     -------
     ::
 
-        rp.excel_report(returns, w, MAR=0, alpha=0.05, name='report', files=None)
+        rp.excel_report(returns,
+                        w,
+                        rf=0,
+                        alpha=0.05,
+                        t_factor=252,
+                        ini_days=1,
+                        days_per_year=252,
+                        name="report")
 
-    .. image:: images/Excel.png
+    .. image:: ../images/Excel.png
 
     """
     n1 = w.shape[0]
     n2 = returns.shape[0]
 
     portfolios = w.columns.tolist()
+    returns.index = returns.index.tz_localize(None)
     dates = returns.index.tolist()
     year = str(datetime.datetime.now().year)
     days = (returns.index[-1] - returns.index[0]).days + ini_days
@@ -473,7 +574,7 @@ def excel_report(
         )
         EVaR = (
             "="
-            + str(rk.EVaR_Hist(returns @ w, alpha=alpha)[0])
+            + str(rk.EVaR_Hist(returns @ w.iloc[:, j], alpha=alpha, solver=solver)[0])
             + " * SQRT("
             + str(t_factor)
             + ")"
@@ -508,7 +609,7 @@ def excel_report(
             + DaR[2:]
             + ")"
         )
-        EDaR = "=" + str(rk.EDaR_Abs(returns @ w, alpha=alpha)[0])
+        EDaR = "=" + str(rk.EDaR_Abs(returns @ w.iloc[:, j], alpha=alpha)[0])
         UCI = "=SQRT(SUMSQ(Drawdown!" + r_2 + ")/COUNT(Drawdown!" + r_2 + "))"
         MAR = "=" + str(rf)
         FLPM = "=AVERAGE(devBelowTarget!" + r_2 + ") * SQRT(" + str(t_factor) + ")"
@@ -587,5 +688,4 @@ def excel_report(
     worksheet1.write(33, 0, "(3) Based on uncompounded cumulated returns")
     worksheet1.write(0, 0, "Riskfolio-Lib Report", cell_format2)
 
-    writer.save()
     workbook.close()

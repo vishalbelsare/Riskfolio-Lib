@@ -1,6 +1,7 @@
 """"""  #
+
 """
-Copyright (c) 2020-2022, Dany Cajas
+Copyright (c) 2020-2026, Dany Cajas
 All rights reserved.
 This work is licensed under BSD 3-Clause "New" or "Revised" License.
 License available at https://github.com/dcajasn/Riskfolio-Lib/blob/master/LICENSE.txt
@@ -8,18 +9,21 @@ License available at https://github.com/dcajasn/Riskfolio-Lib/blob/master/LICENS
 
 import numpy as np
 import pandas as pd
+import cvxpy as cp
 import statsmodels.api as sm
+import scipy.stats as st
 import sklearn.covariance as skcov
 import arch.bootstrap as bs
+
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 from numpy.linalg import inv
 from itertools import product
+
 import riskfolio.src.AuxFunctions as af
 import riskfolio.src.DBHT as db
 import riskfolio.src.GerberStatistic as gs
 import riskfolio.external.cppfunctions as cf
-
 
 __all__ = [
     "mean_vector",
@@ -33,29 +37,43 @@ __all__ = [
     "black_litterman",
     "augmented_black_litterman",
     "black_litterman_bayesian",
+    "entropy_pooling",
     "bootstrapping",
+    "normal_simulation",
 ]
 
 
-def mean_vector(X, method="hist", d=0.94):
+def mean_vector(X, method="hist", d=0.94, target="b1"):
     r"""
     Calculate the expected returns vector using the selected method.
 
     Parameters
     ----------
-    X : DataFrame of shape (n_samples, n_features)
-        Features matrix, where n_samples is the number of samples and
-        n_features is the number of features.
+    X : DataFrame of shape (n_samples, n_assets)
+        Assets returns DataFrame, where n_samples is the number of
+        observations and n_assets is the number of assets.
     method : str, optional
         The method used to estimate the expected returns.
         The default value is 'hist'. Possible values are:
 
-        - 'hist': use historical estimates.
-        - 'ewma1': use ewma with adjust=True. For more information see `EWM <https://pandas.pydata.org/pandas-docs/stable/user_guide/window.html#exponentially-weighted-window>`_.
-        - 'ewma2': use ewma with adjust=False. For more information see `EWM <https://pandas.pydata.org/pandas-docs/stable/user_guide/window.html#exponentially-weighted-window>`_.
+        - 'hist': use historical estimator.
+        - 'ewma1': use ewma with adjust=True. For more information see `EWM <https://pandas.pydata.org/pandas-docs/stable/user_guide/window.html#exponentially-weighted-window>`__.
+        - 'ewma2': use ewma with adjust=False. For more information see `EWM <https://pandas.pydata.org/pandas-docs/stable/user_guide/window.html#exponentially-weighted-window>`__.
+        - 'JS': James-Stein estimator. For more information see :cite:`b-Meucci2005` and :cite:`b-Feng2016`.
+        - 'BS': Bayes-Stein estimator. For more information see :cite:`b-Jorion1986`.
+        - 'BOP': BOP estimator. For more information see :cite:`b-Bodnar2019`.
+
     d : scalar
         The smoothing factor of ewma methods.
         The default is 0.94.
+
+    target : str, optional
+        The target mean vector. The default value is 'b1'.
+        Possible values are:
+
+        - 'b1': grand mean.
+        - 'b2': volatility weighted grand mean.
+        - 'b3': mean square error of sample mean.
 
     Returns
     -------
@@ -80,29 +98,78 @@ def mean_vector(X, method="hist", d=0.94):
         mu = np.array(X.ewm(alpha=1 - d).mean().iloc[-1, :], ndmin=2)
     elif method == "ewma2":
         mu = np.array(X.ewm(alpha=1 - d, adjust=False).mean().iloc[-1, :], ndmin=2)
+    elif method == "ewma2":
+        mu = np.array(X.ewm(alpha=1 - d, adjust=False).mean().iloc[-1, :], ndmin=2)
+    elif method in ["JS", "BS", "BOP"]:
+        T, n = np.array(X, ndmin=2).shape
+        ones = np.ones((n, 1))
+        mu = np.array(X.mean(), ndmin=2).reshape(-1, 1)
+        Sigma = np.cov(X, rowvar=False)
+        Sigma_inv = np.linalg.inv(Sigma)
+        eigvals = np.linalg.eigvals(Sigma)
+
+        # Calculate target vector
+        if target == "b1":
+            b = ones.T @ mu / n * ones
+        elif target == "b2":
+            b = ones.T @ Sigma_inv @ mu / (ones.T @ Sigma_inv @ ones) * ones
+        elif target == "b3":
+            b = np.trace(Sigma) / T * ones
+
+        # Calculate Estimators
+        if method == "JS":
+            alpha_1 = (
+                1
+                / T
+                * (n * np.mean(eigvals) - 2 * np.max(eigvals))
+                / ((mu - b).T @ (mu - b))
+            )
+            mu = (1 - alpha_1) * mu + alpha_1 * b
+        elif method == "BS":
+            alpha_1 = (n + 2) / ((n + 2) + T * (mu - b).T @ Sigma_inv @ (mu - b))
+            mu = (1 - alpha_1) * mu + alpha_1 * b
+        elif method == "BOP":
+            alpha_1 = (mu.T @ Sigma_inv @ mu - n / (T - n)) * b.T @ Sigma_inv @ b - (
+                mu.T @ Sigma_inv @ b
+            ) ** 2
+            alpha_1 /= (mu.T @ Sigma_inv @ mu) * (b.T @ Sigma_inv @ b) - (
+                mu.T @ Sigma_inv @ b
+            ) ** 2
+            beta_1 = (1 - alpha_1) * (mu.T @ Sigma_inv @ b) / (mu.T @ Sigma_inv @ mu)
+            mu = alpha_1 * mu + beta_1 * b
+        mu = mu.T
 
     mu = pd.DataFrame(np.array(mu, ndmin=2), columns=assets)
 
     return mu
 
 
-def covar_matrix(X, method="hist", d=0.94, **kwargs):
+def covar_matrix(
+    X,
+    method="hist",
+    d=0.94,
+    alpha=0.1,
+    bWidth=0.01,
+    detone=False,
+    mkt_comp=1,
+    threshold=0.5,
+):
     r"""
     Calculate the covariance matrix using the selected method.
 
     Parameters
     ----------
-    X : DataFrame of shape (n_samples, n_features)
-        Features matrix, where n_samples is the number of samples and
-        n_features is the number of features.
+    X : DataFrame of shape (n_samples, n_assets)
+        Assets returns DataFrame, where n_samples is the number of
+        observations and n_assets is the number of assets.
     method : str, optional
         The method used to estimate the covariance matrix:
         The default is 'hist'. Possible values are:
 
         - 'hist': use historical estimates.
         - 'semi': use semi lower covariance matrix.
-        - 'ewma1': use ewma with adjust=True. For more information see `EWM <https://pandas.pydata.org/pandas-docs/stable/user_guide/window.html#exponentially-weighted-window>`_.
-        - 'ewma2': use ewma with adjust=False. For more information see `EWM <https://pandas.pydata.org/pandas-docs/stable/user_guide/window.html#exponentially-weighted-window>`_.
+        - 'ewma1': use ewma with adjust=True. For more information see `EWM <https://pandas.pydata.org/pandas-docs/stable/user_guide/window.html#exponentially-weighted-window>`__.
+        - 'ewma2': use ewma with adjust=False. For more information see `EWM <https://pandas.pydata.org/pandas-docs/stable/user_guide/window.html#exponentially-weighted-window>`__.
         - 'ledoit': use the Ledoit and Wolf Shrinkage method.
         - 'oas': use the Oracle Approximation Shrinkage method.
         - 'shrunk': use the basic Shrunk Covariance method.
@@ -113,13 +180,21 @@ def covar_matrix(X, method="hist", d=0.94, **kwargs):
         - 'shrink': denoise using shrink method. For more information see chapter 2 of :cite:`b-MLforAM`.
         - 'gerber1': use the Gerber statistic 1. For more information see: :cite:`b-Gerber2021`.
         - 'gerber2': use the Gerber statistic 2. For more information see: :cite:`b-Gerber2021`.
+
     d : scalar
-        The smoothing factor of ewma methods.
-        The default is 0.94.
-    **kwargs:
-        Other variables related to covariance estimation. See
-        `Scikit Learn <https://scikit-learn.org/stable/modules/covariance.html>`_
-        and chapter 2 of :cite:`b-MLforAM` for more details.
+        The smoothing factor of ewma methods. The default is 0.94.
+    alpha : scalar
+        The shrfactor of shrunk and shrink method. The default is 0.1.
+    bWidth : float
+        The bandwidth of the kernel for 'fixed', 'spectral' and 'shrink' methods.
+    detone : bool, optional
+        If remove the first mkt_comp of correlation matrix for 'fixed', 'spectral'
+        and 'shrink' methods. The detone correlation matrix is singular, so it
+        cannot be inverted.
+    mkt_comp : int, optional
+        Number of first components that will be removed using the detone method.
+    threshold : float
+        Threshold for 'gerber1' and 'gerber2' methods is between 0 and 1.
 
     Returns
     -------
@@ -139,8 +214,8 @@ def covar_matrix(X, method="hist", d=0.94, **kwargs):
     assets = X.columns.tolist()
 
     if method == "hist":
-        cov = np.cov(X.T)
-    if method == "semi":
+        cov = np.cov(X, rowvar=False)
+    elif method == "semi":
         T, N = X.shape
         mu = X.mean().to_numpy().reshape(1, -1)
         a = X - np.repeat(mu, T, axis=0)
@@ -155,52 +230,67 @@ def covar_matrix(X, method="hist", d=0.94, **kwargs):
         item = cov.iloc[-1, :].name[0]
         cov = cov.loc[(item, slice(None)), :]
     elif method == "ledoit":
-        lw = skcov.LedoitWolf(**kwargs)
+        lw = skcov.LedoitWolf()
         lw.fit(X)
         cov = lw.covariance_
     elif method == "oas":
-        oas = skcov.OAS(**kwargs)
+        oas = skcov.OAS()
         oas.fit(X)
         cov = oas.covariance_
     elif method == "shrunk":
-        sc = skcov.ShrunkCovariance(**kwargs)
+        sc = skcov.ShrunkCovariance(shrinkage=alpha)
         sc.fit(X)
         cov = sc.covariance_
     elif method == "gl":
-        gl = skcov.GraphicalLassoCV(**kwargs)
+        gl = skcov.GraphicalLassoCV()
         gl.fit(X)
         cov = gl.covariance_
     elif method == "jlogo":
-        S = np.cov(X.T)
-        R = np.corrcoef(X.T)
+        S = np.cov(X, rowvar=False)
+        R = np.corrcoef(X, rowvar=False)
         D = np.sqrt(np.clip((1 - R) / 2, a_min=0.0, a_max=1.0))
-        (_, _, separators, cliques, _) = db.PMFG_T2s(1 - D**2, nargout=4)
+        _, _, separators, cliques, _ = db.PMFG_T2s(1 - D**2, nargout=4)
         cov = db.j_LoGo(S, separators, cliques)
         cov = np.linalg.inv(cov)
     elif method in ["fixed", "spectral", "shrink"]:
-        cov = np.cov(X.T)
+        cov = np.cov(X, rowvar=False)
         T, N = X.shape
         q = T / N
-        cov = af.denoiseCov(cov, q, kind=method, **kwargs)
+        cov = af.denoiseCov(
+            cov,
+            q,
+            kind=method,
+            bWidth=bWidth,
+            detone=detone,
+            mkt_comp=int(mkt_comp),
+            alpha=alpha,
+        )
     elif method == "gerber1":
-        cov = gs.gerber_cov_stat1(X, **kwargs)
+        cov = gs.gerber_cov_stat1(X, threshold=threshold)
     elif method == "gerber2":
-        cov = gs.gerber_cov_stat2(X, **kwargs)
+        cov = gs.gerber_cov_stat2(X, threshold=threshold)
 
     cov = pd.DataFrame(np.array(cov, ndmin=2), columns=assets, index=assets)
 
     return cov
 
 
-def cokurt_matrix(X, method="hist", **kwargs):
+def cokurt_matrix(
+    X,
+    method="hist",
+    alpha=0.1,
+    bWidth=0.01,
+    detone=False,
+    mkt_comp=1,
+):
     r"""
     Calculate the cokurtosis square matrix using the selected method.
 
     Parameters
     ----------
-    X : DataFrame of shape (n_samples, n_features)
-        Features matrix, where n_samples is the number of samples and
-        n_features is the number of features.
+    X : DataFrame of shape (n_samples, n_assets)
+        Assets returns DataFrame, where n_samples is the number of
+        observations and n_assets is the number of assets.
     method : str, optional
         The method used to estimate the cokurtosis square matrix:
         The default is 'hist'. Possible values are:
@@ -210,9 +300,14 @@ def cokurt_matrix(X, method="hist", **kwargs):
         - 'fixed': denoise using fixed method. For more information see chapter 2 of :cite:`b-MLforAM`.
         - 'spectral': denoise using spectral method. For more information see chapter 2 of :cite:`b-MLforAM`.
         - 'shrink': denoise using shrink method. For more information see chapter 2 of :cite:`b-MLforAM`.
-    **kwargs:
-        Other variables related to covariance estimation. See
-        chapter 2 of :cite:`b-MLforAM` for more details.
+    bWidth : float
+        The bandwidth of the kernel for 'fixed', 'spectral' and 'shrink' methods.
+    detone : bool, optional
+        If remove the first mkt_comp of correlation matrix for 'fixed', 'spectral'
+        and 'shrink' methods. The detone correlation matrix is singular, so it
+        cannot be inverted.
+    mkt_comp : int, optional
+        Number of first components that will be removed using the detone method.
 
     Returns
     -------
@@ -231,17 +326,25 @@ def cokurt_matrix(X, method="hist", **kwargs):
 
     assets = X.columns.tolist()
     cols = list(product(assets, assets))
-    cols = [y + " - " + x for x, y in cols]
+    cols = [str(y) + " - " + str(x) for x, y in cols]
 
     if method == "hist":
-        kurt = af.cokurtosis_matrix(X)
+        kurt = cf.cokurtosis_matrix(X)
     if method == "semi":
-        kurt = af.semi_cokurtosis_matrix(X)
+        kurt = cf.semi_cokurtosis_matrix(X)
     elif method in ["fixed", "spectral", "shrink"]:
-        kurt = cf.kurtosis_matrix(X)
+        kurt = cf.cokurtosis_matrix(X)
         T, N = X.shape
         q = T / N
-        kurt = af.denoiseCov(kurt, q, kind=method, **kwargs)
+        kurt = af.denoiseCov(
+            kurt,
+            q,
+            kind=method,
+            bWidth=bWidth,
+            detone=detone,
+            mkt_comp=mkt_comp,
+            alpha=alpha,
+        )
 
     kurt = pd.DataFrame(np.array(kurt, ndmin=2), columns=cols, index=cols)
 
@@ -256,11 +359,12 @@ def forward_regression(X, y, criterion="pvalue", threshold=0.05, verbose=False):
 
     Parameters
     ----------
-    X : DataFrame of shape (n_samples, n_features)
-        Features matrix, where n_samples is the number of samples and
-        n_features is the number of features.
+    X : DataFrame of shape (n_samples, n_factors)
+        Risk factors returns matrix, where n_samples is the number of samples
+        and n_factors is the number of risk factors.
     y : Series of shape (n_samples, 1)
-        Target vector, where n_samples in the number of samples.
+        Asset returns column DataFrame or Series, where n_samples is the number
+        of samples.
     criterion : str, optional
         The default is 'pvalue'. Possible values of the criterion used to select
         the best features are:
@@ -271,7 +375,7 @@ def forward_regression(X, y, criterion="pvalue", threshold=0.05, verbose=False):
         - 'R2': select the features based on highest R Squared.
         - 'R2_A': select the features based on highest Adjusted R Squared.
 
-    thresholdt : scalar, optional
+    threshold : scalar, optional
         Is the maximum p-value for each variable that will be
         accepted in the model. The default is 0.05.
     verbose : bool, optional
@@ -438,11 +542,12 @@ def backward_regression(X, y, criterion="pvalue", threshold=0.05, verbose=False)
 
     Parameters
     ----------
-    X : DataFrame of shape (n_samples, n_features)
-        Features matrix, where n_samples is the number of samples and
-        n_features is the number of features.
+    X : DataFrame of shape (n_samples, n_factors)
+        Risk factors returns matrix, where n_samples is the number of samples
+        and n_factors is the number of risk factors.
     y : Series of shape (n_samples, 1)
-        Target vector, where n_samples in the number of samples.
+        Asset returns column DataFrame or Series, where n_samples is the number
+        of samples.
     criterion : str, optional
         The default is 'pvalue'. Possible values of the criterion used to select
         the best features are:
@@ -507,7 +612,7 @@ def backward_regression(X, y, criterion="pvalue", threshold=0.05, verbose=False)
                     "Drop {} with p-value {:.6}".format(pvalues.idxmax(), pvalues.max())
                 )
 
-        included = pvalues.index.tolist()
+        included = pvalues[pvalues.index != "const"].index.tolist()
 
         # This part is how to deal when there isn't an asset with pvalue lower than threshold
         if len(included) == 0:
@@ -607,11 +712,12 @@ def PCR(X, y, n_components=0.95):
 
     Parameters
     ----------
-    X : DataFrame of shape (n_samples, n_features)
-        Features matrix, where n_samples is the number of samples and
-        n_features is the number of features.
-    y : Series of shape (n_samples, 1)
-        Target vector, where n_samples in the number of samples.
+    X : DataFrame of shape (n_samples, n_factors)
+        Risk factors returns matrix, where n_samples is the number of samples
+        and n_factors is the number of risk factors.
+    y : DataFrame or Series of shape (n_samples, 1)
+        Asset returns column DataFrame or Series, where n_samples is the number
+        of samples.
     n_components : int, float, None or str, optional
         if 1 < n_components (int), it represents the number of components that
         will be keep. if 0 < n_components < 1 (float), it represents the
@@ -645,7 +751,11 @@ def PCR(X, y, n_components=0.95):
     scaler.fit(X)
     X_std = scaler.transform(X)
 
-    pca = PCA(n_components=n_components)
+    if n_components > 0 and n_components < 1:
+        pca = PCA(n_components=n_components)
+    elif n_components >= 1:
+        pca = PCA(n_components=int(n_components))
+
     pca.fit(X_std)
     Z_p = pca.transform(X_std)
     V_p = pca.components_.T
@@ -681,15 +791,18 @@ def loadings_matrix(
 
     Parameters
     ----------
-    X : DataFrame of shape (n_samples, n_features)
-        Features matrix, where n_samples is the number of samples and
-        n_features is the number of features.
+    X : DataFrame of shape (n_samples, n_factors)
+        Risk factors returns matrix, where n_samples is the number of samples
+        and n_factors is the number of risk factors.
     Y : DataFrame of shape (n_samples, n_assets)
-        Target matrix, where n_samples in the number of samples and
-        n_assets is the number of assets.
-    feature_selection: str 'stepwise' or 'PCR', optional
+        Assets returns DataFrame, where n_samples is the number of
+        observations and n_assets is the number of assets.
+    feature_selection: str, 'stepwise' or 'PCR', optional
         Indicate the method used to estimate the loadings matrix.
-        The default is 'stepwise'.
+        The default is 'stepwise'.  Possible values are:
+
+        - 'stepwise': use stepwise regression to select the best factors and estimate coefficients.
+        - 'PCR': use principal components regression to estimate coefficients.
     stepwise: str 'Forward' or 'Backward', optional
         Indicate the method used for stepwise regression.
         The default is 'Forward'.
@@ -717,7 +830,7 @@ def loadings_matrix(
     Returns
     -------
     loadings : DataFrame
-        A DataFrame with the loadings matrix.
+        Loadings matrix.
 
     Raises
     ------
@@ -764,29 +877,35 @@ def risk_factors(
     X,
     Y,
     B=None,
-    const=False,
+    const=True,
     method_mu="hist",
     method_cov="hist",
+    method_kurt="hist",
     feature_selection="stepwise",
     stepwise="Forward",
     criterion="pvalue",
     threshold=0.05,
     n_components=0.95,
-    error=True,
-    **kwargs
+    higher_comoments=False,
+    dict_mu={},
+    dict_cov={},
+    dict_kurt={},
 ):
     r"""
-    Estimate the expected returns vector and covariance matrix based on risk
-    factors models :cite:`b-Ross` :cite:`b-Fan`.
+    Estimate the expected returns vector, covariance matrix, coskewness tensor and
+    cokurtosis square matrix based on risk factors models :cite:`b-Ross`
+    :cite:`b-Fan` :cite:`b-Boudt2015`.
 
     .. math::
         \begin{aligned}
         R & = \alpha + B F + \epsilon \\
-        \mu_{f} & = \alpha +BE(F) \\
-        \Sigma_{f} & = B \Sigma_{F} B^{T} + \Sigma_{\epsilon} \\
+        \mu_{f} & = \alpha + B \mu_{F} \\
+        \Sigma_{f} & = B \Sigma_{F} B^{\prime} + \Sigma_{\epsilon} \\
+        \Phi_{f} & = B \Phi_{F} \left ( B^{\prime} \otimes B^{\prime} \right )+ \Phi_{\epsilon} \\
+        \Psi_{f} & = \left ( B \otimes B \right ) \Psi_{F} \left ( B^{\prime} \otimes B^{\prime} \right ) + \Psi_{\epsilon} \\
         \end{aligned}
-        
-        
+
+
     where:
 
     :math:`R` is the series returns.
@@ -795,11 +914,19 @@ def risk_factors(
 
     :math:`B` is the loadings matrix.
 
-    :math:`F` is the expected returns vector of the risk factors.
+    :math:`\mu_{F}` is the expected returns vector of the risk factors.
 
     :math:`\Sigma_{F}` is the covariance matrix of the risk factors.
 
+    :math:`\Phi_{F}` is the coskewness tensor of the risk factors.
+
+    :math:`\Psi_{F}` is the cokurtosis square matrix of the risk factors.
+
     :math:`\Sigma_{\epsilon}` is the covariance matrix of error terms.
+
+    :math:`\Phi_{\epsilon}` is the coskewness tensor of error terms.
+
+    :math:`\Psi_{\epsilon}` is the cokurtosis square matrix of error terms.
 
     :math:`\mu_{f}` is the expected returns vector obtained with the
     risk factor model.
@@ -807,23 +934,69 @@ def risk_factors(
     :math:`\Sigma_{f}` is the covariance matrix obtained with the risk
     factor model.
 
+    :math:`\Phi_{f}` is the coskewness tensor obtained with the risk
+    factor model.
+
+    :math:`\Psi_{f}` is the cokurtosis square matrix obtained with the risk
+    factor model.
+
     Parameters
     ----------
-    X : DataFrame of shape (n_samples, n_features)
-        Features matrix, where n_samples is the number of samples and
-        n_features is the number of features.
+    X : DataFrame of shape (n_samples, n_factors)
+        Risk factors returns matrix, where n_samples is the number of samples
+        and n_factors is the number of risk factors.
     Y : DataFrame of shape (n_samples, n_assets)
-        Target matrix, where n_samples in the number of samples and
-        n_assets is the number of assets.
-    B : DataFrame of shape (n_assets, n_features), optional
-        Loadings matrix. If is not specified, is estimated using
+        Assets returns DataFrame, where n_samples is the number of
+        observations and n_assets is the number of assets.
+    B : DataFrame of shape (n_assets, n_factors), optional
+        Loadings matrix, where n_assets is the number assets and n_factors is
+        the number of risk factors. If is not specified, is estimated using
         stepwise regression. The default is None.
     const : bool, optional
         Indicate if the loadings matrix has a constant.
         The default is False.
-    method: str, 'stepwise' or 'PCR', optional
+    method_mu : str, optional
+        The method used to estimate the expected returns of factors.
+        The default value is 'hist'. Possible values are:
+
+        - 'hist': use historical estimates.
+        - 'ewma1'': use ewma with adjust=True, see `EWM <https://pandas.pydata.org/pandas-docs/stable/user_guide/computation.html#exponentially-weighted-windows>`__ for more details.
+        - 'ewma2': use ewma with adjust=False, see `EWM <https://pandas.pydata.org/pandas-docs/stable/user_guide/computation.html#exponentially-weighted-windows>`__ for more details.
+        - 'JS': James-Stein estimator. For more information see :cite:`b-Meucci2005` and :cite:`b-Feng2016`.
+        - 'BS': Bayes-Stein estimator. For more information see :cite:`b-Jorion1986`.
+        - 'BOP': BOP estimator. For more information see :cite:`b-Bodnar2019`.
+    method_cov : str, optional
+        The method used to estimate the covariance matrix of factors.
+        The default is 'hist'. Possible values are:
+
+        - 'hist': use historical estimates.
+        - 'ewma1'': use ewma with adjust=True, see `EWM <https://pandas.pydata.org/pandas-docs/stable/user_guide/computation.html#exponentially-weighted-windows>`__ for more details.
+        - 'ewma2': use ewma with adjust=False, see `EWM <https://pandas.pydata.org/pandas-docs/stable/user_guide/computation.html#exponentially-weighted-windows>`__ for more details.
+        - 'ledoit': use the Ledoit and Wolf Shrinkage method.
+        - 'oas': use the Oracle Approximation Shrinkage method.
+        - 'shrunk': use the basic Shrunk Covariance method.
+        - 'gl': use the basic Graphical Lasso Covariance method.
+        - 'jlogo': use the j-LoGo Covariance method. For more information see: :cite:`b-jLogo`.
+        - 'fixed': denoise using fixed method. For more information see chapter 2 of :cite:`b-MLforAM`.
+        - 'spectral': denoise using spectral method. For more information see chapter 2 of :cite:`b-MLforAM`.
+        - 'shrink': denoise using shrink method. For more information see chapter 2 of :cite:`b-MLforAM`.
+        - 'gerber1': use the Gerber statistic 1. For more information see: :cite:`b-Gerber2021`.
+        - 'gerber2': use the Gerber statistic 2. For more information see: :cite:`b-Gerber2021`.
+    method_kurt : str, optional
+        The method used to estimate the cokurtosis square matrix:
+        The default is 'hist'. Possible values are:
+
+        - 'hist': use historical estimates.
+        - 'semi': use semi lower cokurtosis square matrix.
+        - 'fixed': denoise using fixed method. For more information see chapter 2 of :cite:`b-MLforAM`.
+        - 'spectral': denoise using spectral method. For more information see chapter 2 of :cite:`b-MLforAM`.
+        - 'shrink': denoise using shrink method. For more information see chapter 2 of :cite:`b-MLforAM`.
+    feature_selection: str, 'stepwise' or 'PCR', optional
         Indicate the method used to estimate the loadings matrix.
-        The default is 'stepwise'.
+        The default is 'stepwise'.  Possible values are:
+
+        - 'stepwise': use stepwise regression to select the best factors and estimate coefficients.
+        - 'PCR': use principal components regression to estimate coefficients.
     stepwise: str, 'Forward' or 'Backward'
         Indicate the method used for stepwise regression.
         The default is 'Forward'.
@@ -845,11 +1018,12 @@ def risk_factors(
         percentage of variance that the is explained by the components kept.
         See `PCA <https://scikit-learn.org/stable/modules/generated/sklearn.decomposition.PCA.html>`_
         for more details. The default is 0.95.
-    error : bool
-        Indicate if diagonal covariance matrix of errors is included (only
-        when B is estimated through a regression).
-    **kwargs : dict
-        Other variables related to the expected returns and covariance estimation.
+    dict_mu : dict
+        Other variables related to the expected returns.
+    dict_cov : dict
+        Other variables related to the covariance estimation.
+    dict_kurt : dict
+        Other variables related to the cokurtosis estimation.
 
     Returns
     -------
@@ -857,10 +1031,14 @@ def risk_factors(
         The mean vector of risk factors model.
     cov : DataFrame
         The covariance matrix of risk factors model.
+    skew : DataFrame
+        The coskewness tensor of risk factors model.
+    kurt : DataFrame
+        The cokurtosis square matrix of risk factors model.
     returns : DataFrame
         The returns based on a risk factor model.
-    nav : DataFrame
-        The cumulated uncompounded returns based on a risk factor model.
+    B : DataFrame
+        Loadings matrix.
 
     Raises
     ------
@@ -885,36 +1063,65 @@ def risk_factors(
     elif not isinstance(B, pd.DataFrame):
         raise ValueError("B must be a DataFrame")
 
-    X1 = X.copy()
-    if const == True or "const" in B.columns.tolist():
-        X1 = sm.add_constant(X)
-
     assets = Y.columns.tolist()
     dates = X.index.tolist()
 
-    mu_f = np.array(mean_vector(X1, method=method_mu, **kwargs), ndmin=2)
-    S_f = np.array(covar_matrix(X1, method=method_cov, **kwargs), ndmin=2)
-    B = np.array(B, ndmin=2)
+    X1 = X.copy()
+    if const == True or ("const" in B.columns.tolist()):
+        mu_f = np.hstack(
+            [
+                np.ones((1, 1)),
+                np.array(mean_vector(X1, method=method_mu, **dict_mu), ndmin=2),
+            ]
+        )
+        X1 = sm.add_constant(X)
+    else:
+        mu_f = np.array(mean_vector(X1, method=method_mu, **dict_mu), ndmin=2)
+    S_f = np.array(covar_matrix(X1, method=method_cov, **dict_cov), ndmin=2)
+    B_ = np.array(B, ndmin=2)
 
-    returns = np.array(X1, ndmin=2) @ B.T
-    mu = B @ mu_f.T
+    returns = np.array(X1, ndmin=2) @ B_.T
+    mu = B_ @ mu_f.T
 
-    if error == True:
-        e = np.array(Y, ndmin=2) - returns
-        S_e = np.diag(np.var(np.array(e), ddof=1, axis=0))
-        S = B @ S_f @ B.T + S_e
-    elif error == False:
-        S = B @ S_f @ B.T
+    e = np.array(Y, ndmin=2) - returns
+    S_e = np.diag(np.var(np.array(e), ddof=1, axis=0))
+    S = B_ @ S_f @ B_.T + S_e
+
+    if higher_comoments:
+        cols = list(product(assets, assets))
+        cols = [str(y) + " - " + str(x) for x, y in cols]
+
+        skew_f = cf.coskewness_matrix(X1).to_numpy()
+        skew_e = cf.residuals_coskewness_fm(e)
+        skew = B_ @ skew_f @ np.kron(B_, B_).T + skew_e
+        skew = pd.DataFrame(skew, index=assets, columns=cols)
+
+        kurt_f = cokurt_matrix(X1, method=method_kurt, **dict_kurt).to_numpy()
+        kurt_e = cf.residuals_cokurtosis_fm(B_, S_f, e)
+        kurt = np.kron(B_, B_) @ kurt_f @ np.kron(B_, B_).T + kurt_e
+        kurt = pd.DataFrame(kurt, index=cols, columns=cols)
+    else:
+        skew, kurt = None, None
 
     mu = pd.DataFrame(mu.T, columns=assets)
     cov = pd.DataFrame(S, index=assets, columns=assets)
     returns = pd.DataFrame(returns, index=dates, columns=assets)
 
-    return mu, cov, returns
+    return mu, cov, returns, B, skew, kurt
 
 
 def black_litterman(
-    X, w, P, Q, delta=1, rf=0, eq=True, method_mu="hist", method_cov="hist", **kwargs
+    X,
+    w,
+    P,
+    Q,
+    delta=1,
+    rf=0,
+    eq=True,
+    method_mu="hist",
+    method_cov="hist",
+    dict_mu={},
+    dict_cov={},
 ):
     r"""
     Estimate the expected returns vector and covariance matrix based
@@ -923,9 +1130,9 @@ def black_litterman(
     .. math::
         \begin{aligned}
         \Pi & = \delta \Sigma w \\
-        \Pi_{BL} & = \left [ (\tau\Sigma)^{-1}+ P^{T} \Omega^{-1}P \right]^{-1}
-        \left[(\tau\Sigma)^{-1} \Pi + P^{T} \Omega^{-1} Q \right] \\
-        M & = \left((\tau\Sigma)^{-1} + P^{T}\Omega^{-1} P \right)^{-1} \\
+        \Pi_{BL} & = \left [ (\tau\Sigma)^{-1}+ P^{\prime} \Omega^{-1}P \right]^{-1}
+        \left[(\tau\Sigma)^{-1} \Pi + P^{\prime} \Omega^{-1} Q \right] \\
+        M & = \left((\tau\Sigma)^{-1} + P^{\prime}\Omega^{-1} P \right)^{-1} \\
         \mu_{BL} & = \Pi_{BL} + r_{f} \\
         \Sigma_{BL} & = \Sigma + M \\
         \end{aligned}
@@ -956,10 +1163,10 @@ def black_litterman(
     Parameters
     ----------
     X : DataFrame of shape (n_samples, n_assets)
-        Assets matrix, where n_samples is the number of samples and
-        n_assets is the number of assets.
-    w : DataFrame of shape (n_assets, 1)
-        Weights matrix, where n_assets is the number of assets.
+        Assets returns DataFrame, where n_samples is the number of
+        observations and n_assets is the number of assets.
+    w : DataFrame or Series of shape (n_assets, 1)
+        Portfolio weights, where n_assets is the number of assets.
     P : DataFrame of shape (n_views, n_assets)
         Analyst's views matrix, can be relative or absolute.
     Q : DataFrame of shape (n_views, 1)
@@ -971,20 +1178,23 @@ def black_litterman(
     eq : bool, optional
         Indicate if use equilibrium or historical excess returns.
         The default is True.
-    method_mu : str, can be {'hist', 'ewma1' or 'ewma2'}
+    method_mu : str, optional
         The method used to estimate the expected returns.
         The default value is 'hist'.
 
         - 'hist': use historical estimates.
-        - 'ewma1': use ewma with adjust=True. For more information see `EWM <https://pandas.pydata.org/pandas-docs/stable/user_guide/window.html#exponentially-weighted-window>`_.
-        - 'ewma2': use ewma with adjust=False. For more information see `EWM <https://pandas.pydata.org/pandas-docs/stable/user_guide/window.html#exponentially-weighted-window>`_.
+        - 'ewma1': use ewma with adjust=True. For more information see `EWM <https://pandas.pydata.org/pandas-docs/stable/user_guide/window.html#exponentially-weighted-window>`__.
+        - 'ewma2': use ewma with adjust=False. For more information see `EWM <https://pandas.pydata.org/pandas-docs/stable/user_guide/window.html#exponentially-weighted-window>`__.
+        - 'JS': James-Stein estimator. For more information see :cite:`b-Meucci2005` and :cite:`b-Feng2016`.
+        - 'BS': Bayes-Stein estimator. For more information see :cite:`b-Jorion1986`.
+        - 'BOP': BOP estimator. For more information see :cite:`b-Bodnar2019`.
     method_cov : str, optional
-        The method used to estimate the covariance matrix:
+        The method used to estimate the covariance matrix.
         The default is 'hist'. Possible values are:
 
         - 'hist': use historical estimates.
-        - 'ewma1': use ewma with adjust=True. For more information see `EWM <https://pandas.pydata.org/pandas-docs/stable/user_guide/window.html#exponentially-weighted-window>`_.
-        - 'ewma2': use ewma with adjust=False. For more information see `EWM <https://pandas.pydata.org/pandas-docs/stable/user_guide/window.html#exponentially-weighted-window>`_.
+        - 'ewma1': use ewma with adjust=True. For more information see `EWM <https://pandas.pydata.org/pandas-docs/stable/user_guide/window.html#exponentially-weighted-window>`__.
+        - 'ewma2': use ewma with adjust=False. For more information see `EWM <https://pandas.pydata.org/pandas-docs/stable/user_guide/window.html#exponentially-weighted-window>`__.
         - 'ledoit': use the Ledoit and Wolf Shrinkage method.
         - 'oas': use the Oracle Approximation Shrinkage method.
         - 'shrunk': use the basic Shrunk Covariance method.
@@ -995,8 +1205,10 @@ def black_litterman(
         - 'shrink': denoise using shrink method. For more information see chapter 2 of :cite:`b-MLforAM`.
         - 'gerber1': use the Gerber statistic 1. For more information see: :cite:`b-Gerber2021`.
         - 'gerber2': use the Gerber statistic 2. For more information see: :cite:`b-Gerber2021`.
-    **kwargs : dict
-        Other variables related to the expected returns and covariance estimation.
+    dict_mu : dict
+        Other variables related to the mean vector estimation method.
+    dict_cov : dict
+        Other variables related to the covariance estimation method.
 
     Returns
     -------
@@ -1025,8 +1237,8 @@ def black_litterman(
     if w.shape[0] == 1:
         w = w.T
 
-    mu = np.array(mean_vector(X, method=method_mu, **kwargs), ndmin=2)
-    S = np.array(covar_matrix(X, method=method_cov, **kwargs), ndmin=2)
+    mu = np.array(mean_vector(X, method=method_mu, **dict_mu), ndmin=2)
+    S = np.array(covar_matrix(X, method=method_cov, **dict_cov), ndmin=2)
     P = np.array(P, ndmin=2)
     Q = np.array(Q, ndmin=2)
     tau = 1 / X.shape[0]
@@ -1059,8 +1271,8 @@ def black_litterman(
 def augmented_black_litterman(
     X,
     w,
-    F=None,
-    B=None,
+    F,
+    B,
     P=None,
     Q=None,
     P_f=None,
@@ -1071,22 +1283,23 @@ def augmented_black_litterman(
     const=True,
     method_mu="hist",
     method_cov="hist",
-    **kwargs
+    dict_mu={},
+    dict_cov={},
 ):
     r"""
     Estimate the expected returns vector and covariance matrix based
-    on the Augmented Black Litterman model :cite:`b-WCheung`.
+    on the Augmented Black Litterman model :cite:`b-Cheung2007`.
 
     .. math::
         \begin{aligned}
-        \Pi^{a} & = \delta \left [ \begin{array}{c} \Sigma \\ \Sigma_{F} B^{T} \\ \end{array} \right ] w \\
+        \Pi^{a} & = \delta \left [ \begin{array}{c} \Sigma \\ \Sigma_{F} B^{\prime} \\ \end{array} \right ] w \\
         P^{a} & = \left [ \begin{array}{cc} P & 0 \\ 0 & P_{F} \\ \end{array} \right ] \\
         Q^{a} & = \left [ \begin{array}{c} Q \\ Q_{F} \\ \end{array} \right ] \\
-        \Sigma^{a} & = \left [ \begin{array}{cc} \Sigma & B \Sigma_{F}\\ \Sigma_{F} B^{T} & \Sigma_{F} \\ \end{array} \right ] \\
+        \Sigma^{a} & = \left [ \begin{array}{cc} \Sigma & B \Sigma_{F}\\ \Sigma_{F} B^{\prime} & \Sigma_{F} \\ \end{array} \right ] \\
         \Omega^{a} & = \left [ \begin{array}{cc} \Omega & 0 \\ 0 & \Omega_{F} \\ \end{array} \right ] \\
-        \Pi^{a}_{BL} & = \left [ (\tau \Sigma^{a})^{-1} + (P^{a})^{T} (\Omega^{a})^{-1} P^{a} \right ]^{-1}
-        \left [ (\tau\Sigma^{a})^{-1} \Pi^{a} + (P^{a})^{T} (\Omega^{a})^{-1} Q^{a} \right ] \\
-        M^{a} & = \left ( (\tau\Sigma^{a})^{-1} + (P^{a})^{T} (\Omega^{a})^{-1} P^{a} \right )^{-1} \\
+        \Pi^{a}_{BL} & = \left [ (\tau \Sigma^{a})^{-1} + (P^{a})^{\prime} (\Omega^{a})^{-1} P^{a} \right ]^{-1}
+        \left [ (\tau\Sigma^{a})^{-1} \Pi^{a} + (P^{a})^{\prime} (\Omega^{a})^{-1} Q^{a} \right ] \\
+        M^{a} & = \left ( (\tau\Sigma^{a})^{-1} + (P^{a})^{\prime} (\Omega^{a})^{-1} P^{a} \right )^{-1} \\
         \mu^{a}_{BL} & = \Pi^{a}_{BL} + r_{f} \\
         \Sigma^{a}_{BL} & = \Sigma^{a} + M^{a} \\
         \end{aligned}
@@ -1099,25 +1312,25 @@ def augmented_black_litterman(
     :math:`\delta` is the risk aversion factor.
 
     :math:`B` is the loadings matrix.
-    
+
     :math:`\Sigma` is the covariance matrix of assets.
-    
+
     :math:`\Sigma_{F}` is the covariance matrix of factors.
 
     :math:`\Sigma^{a}` is the augmented covariance matrix.
-    
+
     :math:`P` is the assets views matrix.
 
     :math:`Q` is the assets views returns matrix.
-    
+
     :math:`P_{F}` is the factors views matrix.
 
-    :math:`Q_{F}` is the factors views returns matrix.    
+    :math:`Q_{F}` is the factors views returns matrix.
 
     :math:`P^{a}` is the augmented views matrix.
-    
+
     :math:`Q^{a}` is the augmented views returns matrix.
-    
+
     :math:`\Pi^{a}` is the augmented equilibrium excess returns.
 
     :math:`\Omega` is the covariance matrix of errors of assets views.
@@ -1135,20 +1348,21 @@ def augmented_black_litterman(
     Parameters
     ----------
     X : DataFrame of shape (n_samples, n_assets)
-        Assets matrix, where n_samples is the number of samples and
-        n_assets is the number of features.
-    w : DataFrame of shape (n_assets, 1)
-        Weights matrix, where n_assets is the number of assets.
-    F : DataFrame of shape (n_samples, n_features)
-        Features matrix, where n_samples is the number of samples and
-        n_features is the number of features.
-    B : DataFrame of shape (n_assets, n_features), optional
-        Loadings matrix. The default is None.    
+        Assets returns DataFrame, where n_samples is the number of
+        observations and n_assets is the number of assets.
+    w : DataFrame or Series of shape (n_assets, 1)
+        Portfolio weights, where n_assets is the number of assets.
+    F : DataFrame of shape (n_samples, n_factors)
+        Risk factors returns DataFrame, where n_samples is the number of samples
+        and n_factors is the number of risk factors.
+    B : DataFrame of shape (n_assets, n_factors), optional
+        Loadings matrix, where n_assets is the number assets and n_factors is
+        the number of risk factors.
     P : DataFrame of shape (n_views, n_assets)
         Analyst's views matrix, can be relative or absolute.
     Q : DataFrame of shape (n_views, 1)
         Expected returns of analyst's views.
-    P_f : DataFrame of shape (n_views, n_features)
+    P_f : DataFrame of shape (n_views, n_factors)
         Analyst's factors views matrix, can be relative or absolute.
     Q_f : DataFrame of shape (n_views, 1)
         Expected returns of analyst's factors views.
@@ -1160,22 +1374,25 @@ def augmented_black_litterman(
         Indicate if use equilibrium or historical excess returns.
         The default is True.
     const : bool, optional
-        Indicate if use equilibrium or historical excess returns.
+        Indicate if the loadings matrix has a constant.
         The default is True.
-    method_mu : str, can be {'hist', 'ewma1' or 'ewma2'}
+    method_mu : str, optional
         The method used to estimate the expected returns.
         The default value is 'hist'.
 
         - 'hist': use historical estimates.
-        - 'ewma1': use ewma with adjust=True. For more information see `EWM <https://pandas.pydata.org/pandas-docs/stable/user_guide/window.html#exponentially-weighted-window>`_.
-        - 'ewma2': use ewma with adjust=False. For more information see `EWM <https://pandas.pydata.org/pandas-docs/stable/user_guide/window.html#exponentially-weighted-window>`_.
+        - 'ewma1': use ewma with adjust=True. For more information see `EWM <https://pandas.pydata.org/pandas-docs/stable/user_guide/window.html#exponentially-weighted-window>`__.
+        - 'ewma2': use ewma with adjust=False. For more information see `EWM <https://pandas.pydata.org/pandas-docs/stable/user_guide/window.html#exponentially-weighted-window>`__.
+        - 'JS': James-Stein estimator. For more information see :cite:`b-Meucci2005` and :cite:`b-Feng2016`.
+        - 'BS': Bayes-Stein estimator. For more information see :cite:`b-Jorion1986`.
+        - 'BOP': BOP estimator. For more information see :cite:`b-Bodnar2019`.
     method_cov : str, optional
-        The method used to estimate the covariance matrix:
+        The method used to estimate the covariance matrix.
         The default is 'hist'. Possible values are:
 
         - 'hist': use historical estimates.
-        - 'ewma1': use ewma with adjust=True. For more information see `EWM <https://pandas.pydata.org/pandas-docs/stable/user_guide/window.html#exponentially-weighted-window>`_.
-        - 'ewma2': use ewma with adjust=False. For more information see `EWM <https://pandas.pydata.org/pandas-docs/stable/user_guide/window.html#exponentially-weighted-window>`_.
+        - 'ewma1': use ewma with adjust=True. For more information see `EWM <https://pandas.pydata.org/pandas-docs/stable/user_guide/window.html#exponentially-weighted-window>`__.
+        - 'ewma2': use ewma with adjust=False. For more information see `EWM <https://pandas.pydata.org/pandas-docs/stable/user_guide/window.html#exponentially-weighted-window>`__.
         - 'ledoit': use the Ledoit and Wolf Shrinkage method.
         - 'oas': use the Oracle Approximation Shrinkage method.
         - 'shrunk': use the basic Shrunk Covariance method.
@@ -1186,8 +1403,10 @@ def augmented_black_litterman(
         - 'shrink': denoise using shrink method. For more information see chapter 2 of :cite:`b-MLforAM`.
         - 'gerber1': use the Gerber statistic 1. For more information see: :cite:`b-Gerber2021`.
         - 'gerber2': use the Gerber statistic 2. For more information see: :cite:`b-Gerber2021`.
-    **kwargs : dict
-        Other variables related to the expected returns and covariance estimation.
+    dict_mu : dict
+        Other variables related to the mean vector estimation method.
+    dict_cov : dict
+        Other variables related to the covariance estimation method.
 
     Returns
     -------
@@ -1216,69 +1435,71 @@ def augmented_black_litterman(
     assets = X.columns.tolist()
     N = len(assets)
 
-    w = np.array(w, ndmin=2)
-    if w.shape[0] == 1:
-        w = w.T
+    w_ = np.array(w, ndmin=2)
+    if w_.shape[0] == 1:
+        w_ = w_.T
 
     if B is not None:
-        B = np.array(B, ndmin=2)
+        B_ = np.array(B, ndmin=2)
         if const == True:
-            alpha = B[:, :1]
-            B = B[:, 1:]
+            alpha = B_[:, :1]
+            B_ = B_[:, 1:]
 
-    mu = np.array(mean_vector(X, method=method_mu, **kwargs), ndmin=2)
-    S = np.array(covar_matrix(X, method=method_cov, **kwargs), ndmin=2)
+    mu = np.array(mean_vector(X, method=method_mu, **dict_mu), ndmin=2)
+    S = np.array(covar_matrix(X, method=method_cov, **dict_cov), ndmin=2)
 
     tau = 1 / X.shape[0]
 
-    if F is not None:
-        mu_f = np.array(mean_vector(F, method=method_mu, **kwargs), ndmin=2)
-        S_f = np.array(covar_matrix(F, method=method_cov, **kwargs), ndmin=2)
+    mu_f = np.array(mean_vector(F, method=method_mu, **dict_mu), ndmin=2)
+    S_f = np.array(covar_matrix(F, method=method_cov, **dict_cov), ndmin=2)
+
+    S_a = np.bmat([[S, B_ @ S_f], [S_f @ B_.T, S_f]])
+    mu_vstack = np.vstack((mu.T, mu_f.T))
+    S_vstack = np.vstack((S, S_f @ B_.T))
 
     if P is not None and Q is not None and P_f is None and Q_f is None:
-        S_a = S
-        P_a = P
-        Q_a = Q
-        Omega = np.array(np.diag(np.diag(P @ (tau * S) @ P.T)), ndmin=2)
-        Omega_a = Omega
+        zeros_2 = np.zeros((P.shape[0], S_f.shape[1]))
+        P_a = np.bmat([np.array(P, ndmin=2), zeros_2])
+        Q_a = np.array(Q, ndmin=2)
+        Omega_a = np.array(np.diag(np.diag(P_a @ (tau * S_a) @ P_a.T)), ndmin=2)
 
         if eq == True:
-            PI_a_ = delta * S_a @ w
+            PI_a_ = delta * S_vstack @ w_
         elif eq == False:
             PI_a_ = mu.T - rf
+
     elif P is None and Q is None and P_f is not None and Q_f is not None:
-        S_a = S_f
-        P_a = P_f
-        Q_a = Q_f
-        Omega_f = np.array(np.diag(np.diag(P_f @ (tau * S_f) @ P_f.T)), ndmin=2)
-        Omega_a = Omega_f
+        zeros_1 = np.zeros((P_f.shape[0], S.shape[1]))
+        P_a = np.bmat([zeros_1, np.array(P_f, ndmin=2)])
+        Q_a = np.array(Q_f, ndmin=2)
+        Omega_a = np.array(np.diag(np.diag(P_a @ (tau * S_a) @ P_a.T)), ndmin=2)
 
         if eq == True:
-            PI_a_ = delta * (S_f @ B.T) @ w
+            print(S_a.shape)
+            print(B_.T.shape)
+            PI_a_ = delta * S_vstack @ w_
         elif eq == False:
             PI_a_ = mu_f.T - rf
 
     elif P is not None and Q is not None and P_f is not None and Q_f is not None:
-        S_a = np.hstack((np.vstack((S, S_f @ B.T)), np.vstack((B @ S_f, S_f))))
-
         P = np.array(P, ndmin=2)
         Q = np.array(Q, ndmin=2)
         P_f = np.array(P_f, ndmin=2)
         Q_f = np.array(Q_f, ndmin=2)
-        zeros_1 = np.zeros((P_f.shape[0], P.shape[1]))
-        zeros_2 = np.zeros((P.shape[0], P_f.shape[1]))
-        P_a = np.hstack((np.vstack((P, zeros_1)), np.vstack((zeros_2, P_f))))
+        zeros_1 = np.zeros((P_f.shape[0], S.shape[1]))
+        zeros_2 = np.zeros((P.shape[0], S_f.shape[1]))
+        P_a = np.bmat([[P, zeros_2], [zeros_1, P_f]])
         Q_a = np.vstack((Q, Q_f))
 
         Omega = np.array(np.diag(np.diag(P @ (tau * S) @ P.T)), ndmin=2)
         Omega_f = np.array(np.diag(np.diag(P_f @ (tau * S_f) @ P_f.T)), ndmin=2)
-        zeros = np.zeros((Omega.shape[0], Omega_f.shape[0]))
-        Omega_a = np.hstack((np.vstack((Omega, zeros.T)), np.vstack((zeros, Omega_f))))
+        zeros_3 = np.zeros((Omega.shape[0], Omega_f.shape[0]))
+        Omega_a = np.bmat([[Omega, zeros_3], [zeros_3.T, Omega_f]])
 
         if eq == True:
-            PI_a_ = delta * (np.vstack((S, S_f @ B.T)) @ w)
+            PI_a_ = delta * S_vstack @ w_
         elif eq == False:
-            PI_a_ = np.vstack((mu.T, mu_f.T)) - rf
+            PI_a_ = mu_vstack - rf
 
     PI_a = inv(inv(tau * S_a) + P_a.T @ inv(Omega_a) @ P_a) @ (
         inv(tau * S_a) @ PI_a_ + P_a.T @ inv(Omega_a) @ Q_a
@@ -1291,11 +1512,6 @@ def augmented_black_litterman(
     mu_a = mu_a.T
     cov_a = S_a + M_a
     w_a = inv(delta * cov_a) @ PI_a
-
-    if P is None and Q is None and P_f is not None and Q_f is not None:
-        mu_a = mu_a @ B.T
-        cov_a = B @ cov_a @ B.T
-        w_a = inv(delta * cov_a) @ B @ PI_a
 
     if const == True:
         mu_a = mu_a[:, :N] + alpha.T
@@ -1315,12 +1531,11 @@ def black_litterman_bayesian(
     Q_f,
     delta=1,
     rf=0,
-    eq=True,
     const=True,
-    diag=True,
     method_mu="hist",
     method_cov="hist",
-    **kwargs
+    dict_mu={},
+    dict_cov={},
 ):
     r"""
     Estimate the expected returns vector and covariance matrix based
@@ -1328,11 +1543,11 @@ def black_litterman_bayesian(
 
     .. math::
         \begin{aligned}
-        \Sigma_{F} & = B \Sigma_{F} B^{T} + D \\
-        \overline{\Pi}_{F} & = \left ( \Sigma_{F}^{-1} + P_{F}^{T}\Omega_{F}^{-1}P_{F} \right )^{-1} \left ( \Sigma_{F}^{-1}\Pi_{F} + P_{F}^{T}\Omega_{F}^{-1}Q_{F} \right) \\
-        \overline{\Sigma}_{F} & = \left ( \Sigma_{F}^{-1} + P_{F}^{T}\Omega_{F}^{-1}P_{F} \right )^{-1} \\
-        \Sigma_{BLB} & = \left( \Sigma^{-1} - \Sigma^{-1} B \left( \overline{\Sigma}_{F}^{-1} + B^{T}\Sigma^{-1}B \right)^{-1} B^{T}\Sigma^{-1} \right )^{-1} \\
-        \mu_{BLB} & = \Sigma_{BLB} \left ( \Sigma^{-1} B \left( \overline{\Sigma}_{F}^{-1} +B^{T}\Sigma^{-1}B \right)^{-1} \overline{\Sigma}_{F}^{-1} \overline{\Pi}_{F} \right ) + r_{f} \\
+        \Sigma_{F} & = B \Sigma_{F} B^{\prime} + D \\
+        \overline{\Pi}_{F} & = \left ( \Sigma_{F}^{-1} + P_{F}^{\prime}\Omega_{F}^{-1}P_{F} \right )^{-1} \left ( \Sigma_{F}^{-1}\Pi_{F} + P_{F}^{\prime}\Omega_{F}^{-1}Q_{F} \right) \\
+        \overline{\Sigma}_{F} & = \left ( \Sigma_{F}^{-1} + P_{F}^{\prime}\Omega_{F}^{-1}P_{F} \right )^{-1} \\
+        \Sigma_{BLB} & = \left( \Sigma^{-1} - \Sigma^{-1} B \left( \overline{\Sigma}_{F}^{-1} + B^{\prime}\Sigma^{-1}B \right)^{-1} B^{\prime}\Sigma^{-1} \right )^{-1} \\
+        \mu_{BLB} & = \Sigma_{BLB} \left ( \Sigma^{-1} B \left( \overline{\Sigma}_{F}^{-1} +B^{\prime}\Sigma^{-1}B \right)^{-1} \overline{\Sigma}_{F}^{-1} \overline{\Pi}_{F} \right ) + r_{f} \\
         \end{aligned}
 
 
@@ -1349,14 +1564,14 @@ def black_litterman_bayesian(
     :math:`\Pi_{F}` is the equilibrium excess returns of factors.
 
     :math:`\overline{\Pi}_{F}` is the posterior excess returns of factors.
-    
+
     :math:`\Sigma_{F}` is the covariance matrix of factors.
 
     :math:`\overline{\Sigma}_{F}` is the posterior covariance matrix of factors.
-    
+
     :math:`P_{F}` is the factors views matrix.
 
-    :math:`Q_{F}` is the factors views returns matrix.    
+    :math:`Q_{F}` is the factors views returns matrix.
 
     :math:`\Omega_{F}` is the covariance matrix of errors of factors views.
 
@@ -1369,14 +1584,15 @@ def black_litterman_bayesian(
     Parameters
     ----------
     X : DataFrame of shape (n_samples, n_assets)
-        Assets matrix, where n_samples is the number of samples and
-        n_assets is the number of assets.
-    F : DataFrame of shape (n_samples, n_features)
-        Features matrix, where n_samples is the number of samples and
-        n_features is the number of features.
-    B : DataFrame of shape (n_assets, n_features), optional
-        Loadings matrix. The default is None.
-    P_f : DataFrame of shape (n_views, n_features)
+        Assets returns DataFrame, where n_samples is the number of
+        observations and n_assets is the number of assets.
+    F : DataFrame of shape (n_samples, n_factors)
+        Risk factors returns DataFrame, where n_samples is the number of samples
+        and n_factors is the number of risk factors.
+    B : DataFrame of shape (n_assets, n_factors), optional
+        Loadings matrix, where n_assets is the number assets and n_factors is
+        the number of risk factors. The default is None.
+    P_f : DataFrame of shape (n_views, n_factors)
         Analyst's factors views matrix, can be relative or absolute.
     Q_f : DataFrame of shape (n_views, 1)
         Expected returns of analyst's factors views.
@@ -1384,31 +1600,26 @@ def black_litterman_bayesian(
         Risk aversion factor. The default value is 1.
     rf : scalar, optional
         Risk free rate. The default is 0.
-    eq : bool, optional
-        Indicate if use equilibrium or historical excess returns.
-        The default is True.
     const : bool, optional
         Indicate if the loadings matrix has a constant.
         The default is True.
-    diag : bool, optional
-        Indicate if we use the diagonal matrix to calculate covariance matrix
-        of factor model, only useful when we work with a factor model based on 
-        a regresion model (only equity portfolio).
-        The default is True.
-    method_mu : str, can be {'hist', 'ewma1' or 'ewma2'}
+    method_mu : str, optional
         The method used to estimate the expected returns.
         The default value is 'hist'.
 
         - 'hist': use historical estimates.
-        - 'ewma1': use ewma with adjust=True. For more information see `EWM <https://pandas.pydata.org/pandas-docs/stable/user_guide/window.html#exponentially-weighted-window>`_.
-        - 'ewma2': use ewma with adjust=False, For more information see `EWM <https://pandas.pydata.org/pandas-docs/stable/user_guide/window.html#exponentially-weighted-window>`_.
+        - 'ewma1': use ewma with adjust=True. For more information see `EWM <https://pandas.pydata.org/pandas-docs/stable/user_guide/window.html#exponentially-weighted-window>`__.
+        - 'ewma2': use ewma with adjust=False, For more information see `EWM <https://pandas.pydata.org/pandas-docs/stable/user_guide/window.html#exponentially-weighted-window>`__.
+        - 'JS': James-Stein estimator. For more information see :cite:`b-Meucci2005` and :cite:`b-Feng2016`.
+        - 'BS': Bayes-Stein estimator. For more information see :cite:`b-Jorion1986`.
+        - 'BOP': BOP estimator. For more information see :cite:`b-Bodnar2019`.
     method_cov : str, optional
         The method used to estimate the covariance matrix:
         The default is 'hist'. Possible values are:
 
         - 'hist': use historical estimates.
-        - 'ewma1': use ewma with adjust=True. For more information see `EWM <https://pandas.pydata.org/pandas-docs/stable/user_guide/window.html#exponentially-weighted-window>`_.
-        - 'ewma2': use ewma with adjust=False. For more information see `EWM <https://pandas.pydata.org/pandas-docs/stable/user_guide/window.html#exponentially-weighted-window>`_.
+        - 'ewma1': use ewma with adjust=True. For more information see `EWM <https://pandas.pydata.org/pandas-docs/stable/user_guide/window.html#exponentially-weighted-window>`__.
+        - 'ewma2': use ewma with adjust=False. For more information see `EWM <https://pandas.pydata.org/pandas-docs/stable/user_guide/window.html#exponentially-weighted-window>`__.
         - 'ledoit': use the Ledoit and Wolf Shrinkage method.
         - 'oas': use the Oracle Approximation Shrinkage method.
         - 'shrunk': use the basic Shrunk Covariance method.
@@ -1419,8 +1630,10 @@ def black_litterman_bayesian(
         - 'shrink': denoise using shrink method. For more information see chapter 2 of :cite:`b-MLforAM`.
         - 'gerber1': use the Gerber statistic 1. For more information see: :cite:`b-Gerber2021`.
         - 'gerber2': use the Gerber statistic 2. For more information see: :cite:`b-Gerber2021`.
-    **kwargs : dict
-        Other variables related to the expected returns and covariance estimation.
+    dict_mu : dict
+        Other variables related to the mean vector estimation method.
+    dict_cov : dict
+        Other variables related to the covariance estimation method.
 
     Returns
     -------
@@ -1451,18 +1664,17 @@ def black_litterman_bayesian(
             alpha = B[:, :1]
             B = B[:, 1:]
 
-    mu_f = np.array(mean_vector(F, method=method_mu, **kwargs), ndmin=2)
+    mu_f = np.array(mean_vector(F, method=method_mu, **dict_mu), ndmin=2)
     mu_f = (mu_f - rf).T
 
     tau = 1 / X.shape[0]
 
-    S_f = np.array(covar_matrix(F, method=method_cov, **kwargs), ndmin=2)
+    S_f = np.array(covar_matrix(F, method=method_cov, **dict_cov), ndmin=2)
     S = B @ S_f @ B.T
 
-    if diag == True:
-        D = X.to_numpy() - F @ B.T
-        D = np.diag(D.var())
-        S = S + D
+    D = X.to_numpy() - F @ B.T
+    D = np.diag(D.var())
+    S = S + D
 
     Omega_f = np.array(np.diag(np.diag(P_f @ (tau * S_f) @ P_f.T)), ndmin=2)
 
@@ -1491,16 +1703,126 @@ def black_litterman_bayesian(
     return mu, cov, w
 
 
-def bootstrapping(X, kind="stationary", q=0.05, n_sim=3000, window=3, seed=0):
+def entropy_pooling(
+    X: np.ndarray | pd.DataFrame,
+    P_eq: np.ndarray = None,
+    Q_eq: np.ndarray = None,
+    P_in: np.ndarray = None,
+    Q_in: np.ndarray = None,
+    higher_comoments: bool = False,
+    solver: str = "CLARABEL",
+):
+    r"""
+    Estimate the optimal scenario weights and comoments parameters using the
+    Entropy Pooling model. The Entropy Pooling model consist in solve the
+    following optimization problem:
+
+    .. math::
+        \begin{align}
+        \min_{Z} & \quad \sum^{T}_{i=1}Z_{i} \ln (Z_{i}) - Z_{i} ln \left ( \frac{1}{T} \right) \\
+        \text{s. t.} & \quad Z \geq 0\\
+        & \quad Z \leq 1\\
+        & \quad \mathbf{1}^{\prime}_{T} Z = 1\\
+        & \quad P_{eq} Z = Q_{eq}\\
+        & \quad P_{in} Z \geq Q_{in}\\
+        \end{align}
+
+    Where:
+
+    :math:`Z` are the scenario weights.
+
+    Parameters
+    ----------
+    X : DataFrame of shape (n_samples, n_assets)
+        Assets returns DataFrame, where n_samples is the number of
+        observations and n_assets is the number of assets.
+    P_eq : np.array, optional
+        Matrix P of views that can be expressed as equality constraints.
+    Q_eq : np.array, optional
+        Matrix Q of views that can be expressed as equality constraints.
+    P_in : np.array, optional
+        Matrix P of views that can be expressed as inequality constraints.
+    Q_in : np.array, optional
+        Matrix Q of views that can be expressed as inequality constraints.
+    higher_comoments : bool, optional
+        If True calculate coskewness tensor and cokurtosis square matrix.
+    solver : str, optional
+        Solver used to solve the Entropy Pooling problem. The default is value 'CLARABEL'.
+
+    Returns
+    -------
+
+    Z : np.array
+        Optimal scenario weights based on the Entropy Pooling model.
+
+    """
+
+    X_ = np.array(X, ndmin=2)
+    T, n = X_.shape
+    ones = np.ones((T, 1)) / T
+
+    # Variable
+    Z = cp.Variable((T, 1))
+
+    # Constraints
+    constraints = [
+        cp.sum(Z) == 1,
+        Z >= 0,
+        Z <= 1,
+    ]
+    if P_eq is not None:
+        constraints += [
+            P_eq @ Z == Q_eq,
+        ]
+    if P_in is not None:
+        constraints += [
+            P_in @ Z >= Q_in,
+        ]
+
+    # Objective function
+    entropy = -cp.sum(cp.entr(Z)) - Z.T @ np.log(ones)
+    objective = cp.Minimize(entropy)
+
+    # Solving the problem
+    prob = cp.Problem(objective, constraints)
+    prob.solve(solver=solver)
+    Z = Z.value
+
+    if Z is not None:
+        mu = Z.T @ X
+        cov = cf.covariance_matrix(X, Z)
+        if higher_comoments:
+            skew = cf.coskewness_matrix(X, Z)
+            kurt = cf.cokurtosis_matrix(X, Z)
+        else:
+            skew = None
+            kurt = None
+        return mu, cov, skew, kurt, Z
+    else:
+        raise ValueError(
+            "Views are incompatible, please try again by removing one of the views."
+        )
+
+
+def bootstrapping(
+    X,
+    kind="stationary",
+    q=0.05,
+    n_sim=6000,
+    window=3,
+    diag=False,
+    threshold=1e-15,
+    seed=0,
+):
     r"""
     Estimates the uncertainty sets of mean and covariance matrix through the selected
     bootstrapping method.
 
     Parameters
     ----------
-    X : DataFrame of shape (n_samples, n_features)
-        Features matrix, where n_samples is the number of samples and
-        n_features is the number of features.
+    X : DataFrame of shape (n_samples, n_assets)
+        Assets returns DataFrame, where n_samples is the number of
+        observations and n_assets is the number of assets.
     kind : str
         The bootstrapping method. The default value is 'stationary'. Possible values are:
 
@@ -1508,32 +1830,51 @@ def bootstrapping(X, kind="stationary", q=0.05, n_sim=3000, window=3, seed=0):
         - 'circular': circular bootstrapping method, see `CircularBlockBootstrap <https://bashtage.github.io/arch/bootstrap/generated/arch.bootstrap.CircularBlockBootstrap.html#arch.bootstrap.CircularBlockBootstrap>`_ for more details.
         - 'moving': moving bootstrapping method, see `MovingBlockBootstrap <https://bashtage.github.io/arch/bootstrap/generated/arch.bootstrap.MovingBlockBootstrap.html#arch.bootstrap.MovingBlockBootstrap>`_ for more details.
     q : scalar
-        Significance level of the selected bootstrapping method.
+        Significance level for box and elliptical constraints.
         The default is 0.05.
     n_sim : scalar
         Number of simulations of the bootstrapping method.
-        The default is 3000.
-    window:
+        The default is 6000.
+    window: int
         Block size of the bootstrapping method. Must be greather than 1
-        and lower than the n_samples - n_features + 1
+        and lower than the n_samples - n_factors + 1
         The default is 3.
-    seed:
+    diag: bool
+        If consider only the main diagonal of covariance matrices of estimation
+        errors following :cite:`b-fabozzi2007robust`. The default is False.
+    threshold: float
+        Parameter used to fix covariance matrices in case they are not positive semidefinite.
+        The default is 1e-15.
+    seed: int
         Seed used to generate random numbers for bootstrapping method.
         The default is 0.
 
     Returns
     -------
     mu_l : DataFrame
-        The q/2 percentile of mean vector obtained through the selected bootstrapping method.
+        The q/2 percentile of mean vector obtained through the selected
+        bootstrapping method.
     mu_u : DataFrame
-        The 1-q/2 percentile of mean vector obtained through the selected bootstrapping method.
+        The 1-q/2 percentile of mean vector obtained through the selected
+        bootstrapping method.
     cov_l : DataFrame
-        The q/2 percentile of covariance matrix obtained through the selected bootstrapping method.
+        The q/2 percentile of covariance matrix obtained through the selected
+        bootstrapping method.
     cov_u : DataFrame
-        The 1-q/2 percentile of covariance matrix obtained through the selected bootstrapping method.
+        The 1-q/2 percentile of covariance matrix obtained through the selected
+        bootstrapping method.
     cov_mu : DataFrame
-        The covariance matrix of estimation errors of mean vector obtained through the selected bootstrapping method.
-        We take the diagonal of this matrix following :cite:`b-fabozzi2007robust`.
+        The covariance matrix of estimation errors of mean vector obtained
+        through the selected bootstrapping method.
+    cov_sigma : DataFrame
+        The covariance matrix of estimation errors of covariance matrix
+        obtained through the selected bootstrapping method.
+    k_mu : DataFrame
+        The square root of size of elliptical constraint of mean vector
+        estimation error based on 1-q percentile.
+    k_sigma : DataFrame
+        The square root of size of elliptical constraint of covariance matrix
+        estimation error based on 1-q percentile.
 
     Raises
     ------
@@ -1552,9 +1893,13 @@ def bootstrapping(X, kind="stationary", q=0.05, n_sim=3000, window=3, seed=0):
 
     cols = X.columns.tolist()
     cols_2 = [i + "-" + j for i in cols for j in cols]
-    m = len(cols)
-    mus = np.zeros((n_sim, 1, m))
-    covs = np.zeros((n_sim, m, m))
+    T, n = X.shape
+
+    mu = X.mean().to_numpy().reshape(1, n)
+    vec_Sigma = X.cov().to_numpy().reshape((1, n**2), order="F")
+
+    mus = np.zeros((n_sim, 1, n))
+    covs = np.zeros((n_sim, n, n))
 
     if kind == "stationary":
         gen = bs.StationaryBootstrap(window, X, seed=seed)
@@ -1568,39 +1913,178 @@ def bootstrapping(X, kind="stationary", q=0.05, n_sim=3000, window=3, seed=0):
     i = 0
     for data in gen.bootstrap(n_sim):
         A = data[0][0]
-        mus[i] = A.mean().to_numpy().reshape(1, m)
+        mus[i] = A.mean().to_numpy().reshape(1, n)
         covs[i] = A.cov().to_numpy()
         i += 1
 
-    mu_l = np.percentile(mus, q / 2 * 100, axis=0, keepdims=True).reshape(1, m)
-    mu_u = np.percentile(mus, 100 - q / 2 * 100, axis=0, keepdims=True).reshape(1, m)
-
-    cov_l = np.percentile(covs, q / 2 * 100, axis=0, keepdims=True).reshape(m, m)
-    cov_u = np.percentile(covs, 100 - q / 2 * 100, axis=0, keepdims=True).reshape(m, m)
-
+    # Box Constraint for Mean
+    mu_l = np.percentile(mus, q=q / 2 * 100, axis=0, keepdims=True).reshape(1, n)
+    mu_u = np.percentile(mus, q=(1 - q / 2) * 100, axis=0, keepdims=True).reshape(1, n)
     mu_l = pd.DataFrame(mu_l, index=[0], columns=cols)
     mu_u = pd.DataFrame(mu_u, index=[0], columns=cols)
 
+    # Box Constraint for Covariance
+    cov_l = np.percentile(covs, q=q / 2 * 100, axis=0, keepdims=True).reshape(n, n)
+    cov_u = np.percentile(covs, q=(1 - q / 2) * 100, axis=0, keepdims=True).reshape(
+        n, n
+    )
     cov_l = pd.DataFrame(cov_l, index=cols, columns=cols)
     cov_u = pd.DataFrame(cov_u, index=cols, columns=cols)
 
-    cov_mu = mus.reshape(n_sim, m) - X.mean().to_numpy().reshape(1, m)
-    cov_mu = np.cov(cov_mu.T)
+    # Check and fix if upper and lower bound for Covariance are positive
+    # semidefinite and fix when they are not
+    if af.is_pos_def(cov_l) == False:
+        cov_l = af.cov_fix(cov_l, method="clipped", threshold=threshold)
+    if af.is_pos_def(cov_u) == False:
+        cov_u = af.cov_fix(cov_u, method="clipped", threshold=threshold)
 
-    cov_mu = np.diag(np.diag(cov_mu))
+    # Elliptical Constraint for Mean
+    A_mu = mus.reshape(n_sim, n) - np.repeat(mu, n_sim, axis=0)
+    cov_mu = np.cov(A_mu, rowvar=False)
+    if diag == True:
+        cov_mu = np.diag(np.diag(cov_mu))
+    k_mus = np.diag(A_mu @ inv(cov_mu) @ A_mu.T)
+    k_mu = np.percentile(k_mus, q=(1 - q) * 100) ** 0.5
     cov_mu = pd.DataFrame(cov_mu, index=cols, columns=cols)
 
-    cov_sigma = covs - X.cov().to_numpy()
-    cov_sigma = cov_sigma.reshape((n_sim, m * m), order="F")
-    cov_sigma = np.cov(cov_sigma.T)
-
-    cov_sigma = np.diag(np.diag(cov_sigma))
+    # Elliptical Constraint for Covariance
+    A_Sigma = covs.reshape((n_sim, n**2), order="F")
+    A_Sigma = A_Sigma - np.repeat(vec_Sigma, n_sim, axis=0)
+    cov_sigma = np.cov(A_Sigma, rowvar=False)
+    cov_sigma = af.cov_fix(cov_sigma, method="clipped", threshold=threshold)
+    if diag == True:
+        cov_sigma = np.diag(np.diag(cov_sigma))
+    if af.is_pos_def(cov_sigma) == False:
+        cov_sigma = af.cov_fix(cov_sigma, method="clipped", threshold=threshold)
+    k_sigmas = np.diag(A_Sigma @ inv(cov_sigma) @ A_Sigma.T)
+    k_sigma = np.percentile(k_sigmas, q=(1 - q) * 100) ** 0.5
     cov_sigma = pd.DataFrame(cov_sigma, index=cols_2, columns=cols_2)
 
+    return mu_l, mu_u, cov_l, cov_u, cov_mu, cov_sigma, k_mu, k_sigma
+
+
+def normal_simulation(X, q=0.05, n_sim=6000, diag=False, threshold=1e-15, seed=0):
+    r"""
+    Estimates the uncertainty sets of mean and covariance matrix assuming that
+    assets returns follows a multivariate normal distribution.
+
+    Parameters
+    ----------
+    X : DataFrame of shape (n_samples, n_assets)
+        Assets returns DataFrame, where n_samples is the number of
+        observations and n_assets is the number of assets.
+    q : scalar
+        Significance level for box and elliptical constraints.
+        The default is 0.05.
+    n_sim : scalar
+        Number of simulations of the bootstrapping method.
+        The default is 6000.
+    diag: bool
+        If consider only the main diagonal of covariance matrices of estimation
+        errors following :cite:`b-fabozzi2007robust`. The default is False.
+    threshold: float
+        Parameter used to fix covariance matrices in case they are not positive
+        semidefinite. The default is 1e-10.
+    seed: int
+        Seed used to generate random numbers for simulation.
+        The default is 0.
+
+    Returns
+    -------
+    mu_l : DataFrame
+        The q/2 percentile of mean vector obtained through the normal
+        simulation.
+    mu_u : DataFrame
+        The 1-q/2 percentile of mean vector obtained through the normal
+        simulation.
+    cov_l : DataFrame
+        The q/2 percentile of covariance matrix obtained through the normal
+        simulation.
+    cov_u : DataFrame
+        The 1-q/2 percentile of covariance matrix obtained through the normal
+        simulation.
+    cov_mu : DataFrame
+        The covariance matrix of estimation errors of mean vector obtained
+        through the normal simulation.
+    cov_sigma : DataFrame
+        The covariance matrix of estimation errors of covariance matrix
+        obtained through the normal simulation.
+    k_mu : DataFrame
+        The square root of size of elliptical constraint of mean vector
+        estimation error based on 1-q percentile.
+    k_sigma : DataFrame
+        The square root of size of elliptical constraint of covariance matrix
+        estimation error based on 1-q percentile.
+
+    Raises
+    ------
+    ValueError
+        When the value cannot be calculated.
+
+    """
+
+    if not isinstance(X, pd.DataFrame):
+        raise ValueError("X must be a DataFrame")
+
+    cols = X.columns.tolist()
+    cols_2 = [i + "-" + j for i in cols for j in cols]
+    T, n = X.shape
+
+    # Set initial parameters based on assumption of normality
+    mu = X.mean().to_numpy().reshape(1, n)
+    vec_Sigma = X.cov().to_numpy().reshape((1, n**2), order="F")
+    Sigma = X.cov().to_numpy()
+    cov_mu = Sigma / T
+    K = cf.commutation_matrix(T=n, n=n)
+    I = np.identity(n**2)
+    cov_sigma = T * (I + K) @ np.kron(cov_mu, cov_mu)
+    if diag == True:
+        cov_sigma = np.diag(np.diag(cov_sigma))
+    if af.is_pos_def(cov_sigma) == False:
+        cov_sigma = af.cov_fix(cov_sigma, method="clipped", threshold=threshold)
+    cov_sigma = pd.DataFrame(cov_sigma, index=cols_2, columns=cols_2)
+
+    # Box Constraint for Mean
+    delta_mu = st.norm.ppf(1 - q / 2) * np.sqrt(np.diag(cov_mu)).reshape(-1, 1)
+    mu_l = mu - delta_mu.T
+    mu_u = mu + delta_mu.T
+    mu_l = pd.DataFrame(mu_l, index=[0], columns=cols)
+    mu_u = pd.DataFrame(mu_u, index=[0], columns=cols)
+
+    # Box Constraints for Covariance
+    rs = np.random.RandomState(seed=seed)
+    covs = st.wishart.rvs(T, cov_mu, size=n_sim, random_state=rs)
+    cov_l = np.percentile(covs, q=q / 2, axis=0)
+    cov_u = np.percentile(covs, q=1 - q / 2, axis=0)
+    cov_l = pd.DataFrame(cov_l, index=cols, columns=cols)
+    cov_u = pd.DataFrame(cov_u, index=cols, columns=cols)
+
+    # Check and fix if upper and lower bound for Covariance are positive
+    # semidefinite and fix when they are not
     if af.is_pos_def(cov_l) == False:
-        cov_l = af.cov_fix(cov_l, method="clipped", threshold=1e-3)
-
+        cov_l = af.cov_fix(cov_l, method="clipped", threshold=threshold)
     if af.is_pos_def(cov_u) == False:
-        cov_u = af.cov_fix(cov_u, method="clipped", threshold=1e-3)
+        cov_u = af.cov_fix(cov_u, method="clipped", threshold=threshold)
 
-    return mu_l, mu_u, cov_l, cov_u, cov_mu, cov_sigma
+    # Elliptical Constraint for Mean
+    A_mu = rs.multivariate_normal(mu.ravel(), cov_mu, size=n_sim)
+    # cov_mu =  np.cov(A_mu - np.repeat(mu, n_sim, axis=0), rowvar=False)
+    if diag == True:
+        cov_mu = np.diag(np.diag(cov_mu))
+    k_mus = np.diag(A_mu @ inv(cov_mu) @ A_mu.T)
+    k_mu = np.percentile(k_mus, q=1 - q) ** 0.5
+    # k_mu = st.chi2.ppf(1 - q, df=n) ** 0.5
+    cov_mu = pd.DataFrame(cov_mu, index=cols, columns=cols)
+
+    # Elliptical Constraint for Covariance
+    A_Sigma = covs.reshape((n_sim, n**2), order="F")
+    A_Sigma = A_Sigma - np.repeat(vec_Sigma, n_sim, axis=0)
+    A_cov_sigma = np.cov(A_Sigma, rowvar=False)
+    if diag == True:
+        A_cov_sigma = np.diag(np.diag(A_cov_sigma))
+    if af.is_pos_def(A_cov_sigma) == False:
+        A_cov_sigma = af.cov_fix(A_cov_sigma, method="clipped", threshold=threshold)
+    k_sigmas = np.diag(A_Sigma @ inv(A_cov_sigma) @ A_Sigma.T)
+    k_sigma = np.percentile(k_sigmas, q=1 - q) ** 0.5
+
+    return mu_l, mu_u, cov_l, cov_u, cov_mu, cov_sigma, k_mu, k_sigma

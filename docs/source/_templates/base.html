@@ -1,0 +1,53 @@
+{% extends "!base.html" %}
+
+{% block extrahead %}
+  {{ super() }}
+  {% if google_site_verification %}
+  <meta name="google-site-verification" content="{{ google_site_verification }}" />
+  {% endif %}
+  <!-- Google Tag Manager -->
+  <script>(function(w,d,s,l,i){w[l]=w[l]||[];w[l].push({'gtm.start':
+  new Date().getTime(),event:'gtm.js'});var f=d.getElementsByTagName(s)[0],
+  j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
+  'https://www.googletagmanager.com/gtm.js?id='+i+dl;f.parentNode.insertBefore(j,f);
+  })(window,document,'script','dataLayer','GTM-NKGZ6C22');</script>
+  <!-- End Google Tag Manager -->
+  {% set page_url = docs_baseurl if pagename == "index" else docs_baseurl ~ pagename ~ ".html" %}
+  {% set social_image_url = docs_baseurl ~ "_static/Riskfolio-social-1200x627.png" %}
+  <link rel="canonical" href="{{ page_url }}" />
+  <meta property="og:site_name" content="Riskfolio-Lib" />
+  <meta property="og:title" content="{{ title|striptags }} | Riskfolio-Lib" />
+  <meta property="og:description" content="Portfolio optimization in Python with Riskfolio-Lib." />
+  <meta property="og:type" content="website" />
+  <meta property="og:locale" content="en_US" />
+  <meta property="og:url" content="{{ page_url }}" />
+  <meta property="og:image" content="{{ social_image_url }}" />
+  <meta property="og:image:secure_url" content="{{ social_image_url }}" />
+  <meta property="og:image:type" content="image/png" />
+  <meta property="og:image:width" content="1200" />
+  <meta property="og:image:height" content="627" />
+  <meta property="og:image:alt" content="Riskfolio-Lib" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="{{ title|striptags }} | Riskfolio-Lib" />
+  <meta name="twitter:description" content="Portfolio optimization in Python with Riskfolio-Lib." />
+  <meta name="twitter:url" content="{{ page_url }}" />
+  <meta name="twitter:image" content="{{ social_image_url }}" />
+  <meta name="twitter:image:alt" content="Riskfolio-Lib" />
+{% endblock %}
+
+{% block body_tag %}
+  <body>
+    <!-- Google Tag Manager (noscript) -->
+    <noscript><iframe src="https://www.googletagmanager.com/ns.html?id=GTM-NKGZ6C22"
+    height="0" width="0" style="display:none;visibility:hidden"></iframe></noscript>
+    <!-- End Google Tag Manager (noscript) -->
+{% endblock %}
+
+{% block announce %}
+  <p>
+    Support the continuous development of Riskfolio-Lib by purchasing the official
+    <a href="https://www.kqzyfj.com/click-101359873-15150084?url=https%3A%2F%2Flink.springer.com%2Fbook%2F9783031843037">book</a>
+    and enrolling in the 
+    <a href="https://www.paypal.com/ncp/payment/GN55W4UQ7VAMN">course</a> today!
+  </p>
+{% endblock %}
